@@ -16,6 +16,9 @@
   <link href="https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="css/app.css">
   <link rel="stylesheet" href="css/paper.css">
+  <link rel="modulepreload" href="vendor/firebase/firebase-app.js">
+  <link rel="modulepreload" href="vendor/firebase/firebase-auth.js">
+  <link rel="modulepreload" href="vendor/firebase/firebase-database.js">
   <script>
     try { const t = localStorage.getItem('bakar-theme'); if (t) document.documentElement.dataset.theme = t; } catch {}
   </script>
@@ -24,6 +27,7 @@
   <header class="topbar">
     <a class="brand" href="#/"><span class="brand-mark">◆</span><span class="brand-name">בקר</span></a>
     <span class="crumb" id="crumb">~</span>
+    <span class="sync" id="sync" hidden><i></i><span></span></span>
     <nav class="nav" aria-label="ניווט ראשי">
       <a href="#/" data-route="home"><span class="nav-ico">⌂</span><span>בית</span></a>
       <a href="#/new/visit" data-route="new"><span class="nav-ico">＋</span><span>דוח חדש</span></a>

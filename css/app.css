@@ -313,6 +313,31 @@ input[dir=ltr] { text-align: left; }
 .toast.danger { background: var(--bad); color: #fff; }
 .toast.out { opacity: 0; transform: translateY(8px); }
 
+/* ===== Auth & sync ===== */
+body.logged-out .nav, body.logged-out .crumb { visibility: hidden; }
+body.logged-out { padding-bottom: 24px; }
+.splash { min-height: 60vh; display: grid; place-items: center; font-size: 40px; color: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+.auth { max-width: 400px; margin: 4vh auto 0; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 28px 22px; }
+.auth-brand { font-weight: 800; font-size: 22px; margin-bottom: 16px; }
+.auth-brand .brand-mark { color: var(--accent); }
+.auth h1 { margin: 0 0 4px; font-size: 24px; }
+.auth > .muted { margin: 0 0 18px; font-size: 14px; }
+.btn.google { background: #fff; color: #1f1f1f; border-color: #dadce0; font-weight: 600; }
+.btn.google .g { font-weight: 800; color: #4285f4; font-family: Arial, sans-serif; }
+.or { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; margin: 18px 0 12px; }
+.or::before, .or::after { content: ''; flex: 1; height: 1px; background: var(--line); }
+.auth-error { color: var(--bad); font-size: 14px; min-height: 1.2em; margin: 0 0 6px; }
+.auth-links { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+button.link { background: none; border: none; padding: 0; cursor: pointer; }
+.sync[hidden] { display: none; }
+.sync { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.sync i { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
+.sync.off i { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
+.account { display: flex; align-items: center; gap: 12px; }
+.avatar { width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center; background: var(--accent); color: var(--accent-ink); font-weight: 800; flex: none; }
+@media (max-width: 760px) { .sync span { display: none; } }
+
 /* ===== Print: only the paper ===== */
 @media print {
   @page { size: A4; margin: 12mm; }

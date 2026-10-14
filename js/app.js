@@ -1,4 +1,5 @@
-import { db, uid, exportBackup, importBackup } from './db.js';
+import { db, uid, exportBackup, parseBackup, useDatabase, takeLegacyData, dropLegacyData } from './db.js';
+import * as cloud from './cloud.js';
 import {
   REPORT_TYPES, ROLES, VISIT_REASONS, MANDATORY_STAGES, MAX_DAYS_BETWEEN_VISITS, PRESTART_DOCS, PRESTART_CHECKS,
   SIGNER_TITLES, DECLARATION, DEFAULT_SUMMARY, STATUS, LEVEL_INFO, SEVERITY, LIKELIHOOD, riskLevel, newReportData,
@@ -10,7 +11,9 @@ import { exportPdf } from './export-pdf.js';
 import { SignaturePad } from './signature.js';
 
 // ---------------- state ----------------
-const state = { settings: null, sites: [], reports: [] };
+// עבודה "מקומית קודם": כל שמירה נכתבת מיד למכשיר (IndexedDB) ובמקביל נשלחת לענן (Firebase).
+// שינויים שמגיעים מהענן (ממכשיר אחר) ממוזגים לפי זמן העדכון האחרון.
+const state = { settings: null, sites: [], reports: [], user: undefined, online: navigator.onLine };
 const $view = document.getElementById('view');
 const today = () => new Date().toISOString().slice(0, 10);
 const DAY = 86400000;
@@ -21,31 +24,194 @@ const DEFAULT_SETTINGS = {
   inspector: { name: '', title: SIGNER_TITLES[0], phone: '', email: '', signature: '' },
   company: { name: '', logo: '' },
   defaultSummary: DEFAULT_SUMMARY,
+  updatedAt: 0,
 };
 
-async function load() {
-  const saved = await db.getKV('settings', null);
-  state.settings = {
+function normalizeSettings(saved) {
+  return {
     ...DEFAULT_SETTINGS, ...saved,
     inspector: { ...DEFAULT_SETTINGS.inspector, ...saved?.inspector },
     company: { ...DEFAULT_SETTINGS.company, ...saved?.company },
   };
-  state.sites = await db.all('sites');
-  state.reports = await db.all('reports');
 }
-const saveSettings = () => db.setKV('settings', state.settings);
+
+// Realtime Database לא שומר מערכים/אובייקטים ריקים — משלימים ברירות מחדל לדוח שהגיע מהענן
+function normalizeReport(r) {
+  const base = newReportData(r.type);
+  const data = { ...base, ...r.data };
+  if (r.type === 'visit') {
+    data.prestartDocs ||= {};
+    data.prestartChecks ||= {};
+    data.reasons = Array.isArray(data.reasons) ? data.reasons : Object.values(data.reasons || {});
+    for (const k of ['risks', 'ppe', 'training']) {
+      const rows = Array.isArray(data[k]) ? data[k] : Object.values(data[k] || {});
+      data[k] = base[k].map((b, i) => ({ ...b, ...rows[i] }));
+    }
+  }
+  const photos = Array.isArray(r.photos) ? r.photos : Object.values(r.photos || {});
+  return { ...r, data, photos, inspector: r.inspector || {} };
+}
+
+async function load() {
+  state.settings = normalizeSettings(await db.getKV('settings', null));
+  state.sites = await db.all('sites');
+  state.reports = (await db.all('reports')).map(normalizeReport);
+}
 const site = (id) => state.sites.find((s) => s.id === id);
 const report = (id) => state.reports.find((r) => r.id === id);
 
+// כתיבה לענן "ברקע": אם אין רשת, ה-SDK של Firebase שומר בתור ושולח כשהחיבור חוזר
+function toCloud(promise) {
+  promise?.catch?.((err) => {
+    console.error(err);
+    if (err?.code === 'PERMISSION_DENIED' || /permission/i.test(err?.message)) toast('אין הרשאה לשמור בענן — בדוק את כללי ה-Database', 'danger');
+  });
+}
+
+async function saveSettings() {
+  state.settings.updatedAt = Date.now();
+  await db.setKV('settings', state.settings);
+  toCloud(cloud.pushSettings(state.settings));
+}
+// _synced = השרת אישר שהפריט קיים בענן. פריט כזה שנעלם מהענן — נמחק ממכשיר אחר.
+function pushSiteNow(s) {
+  return cloud.pushSite(s).then(() => {
+    if (!s._synced) return db.put('sites', Object.assign(s, { _synced: true }));
+  });
+}
+function pushReportNow(r) {
+  return cloud.pushReport(r).then((uploadedPhotos) => {
+    if (uploadedPhotos || !r._synced) return db.put('reports', Object.assign(r, { _synced: true }));
+  });
+}
 async function saveSite(s) {
   s.updatedAt = Date.now();
   if (!state.sites.includes(s)) state.sites.push(s);
   await db.put('sites', s);
+  toCloud(pushSiteNow(s));
 }
 async function saveReport(r) {
   r.updatedAt = Date.now();
   if (!state.reports.includes(r)) state.reports.push(r);
   await db.put('reports', r);
+  toCloud(pushReportNow(r));
+}
+// ייבוא נתונים (משחזור גיבוי או מהגרסה המקומית הישנה) — נשמרים במכשיר ונשלחים לענן
+async function importData(data) {
+  for (const s of data.sites || []) {
+    const cur = site(s.id);
+    if (cur) Object.assign(cur, s);
+    await saveSite(cur || { ...s, _synced: false });
+  }
+  for (const r of data.reports || []) {
+    const item = normalizeReport({ ...r, _synced: false });
+    item.photos.forEach((p) => delete p._up);
+    const i = state.reports.findIndex((x) => x.id === r.id);
+    if (i >= 0) state.reports[i] = item;
+    await saveReport(item);
+  }
+  const settings = (data.kv || []).find((k) => k.key === 'settings')?.value;
+  if (settings) {
+    state.settings = normalizeSettings(settings);
+    await saveSettings();
+  }
+}
+
+async function deleteReport(r) {
+  state.reports = state.reports.filter((x) => x.id !== r.id);
+  await db.del('reports', r.id);
+  toCloud(cloud.removeReport(r));
+}
+async function deleteSite(id) {
+  for (const r of state.reports.filter((x) => x.siteId === id)) await deleteReport(r);
+  state.sites = state.sites.filter((x) => x.id !== id);
+  await db.del('sites', id);
+  toCloud(cloud.removeSite(id));
+}
+
+// ---------------- sync from cloud ----------------
+const userIsTyping = () => document.activeElement?.matches?.('input, textarea, select');
+const scheduleRender = debounce(() => {
+  if (state.user && !userIsTyping()) rerender();
+}, 150);
+
+async function mergeCollection(store, list, remoteMap, { onApply, push }) {
+  let changed = false;
+  for (const [id, remote] of Object.entries(remoteMap)) {
+    const i = list.findIndex((x) => x.id === id);
+    const local = list[i];
+    if (!local || (remote.updatedAt || 0) > (local.updatedAt || 0)) {
+      const item = await onApply({ ...remote, id, _synced: true }, local);
+      if (i >= 0) list[i] = item;
+      else list.push(item);
+      await db.put(store, item);
+      changed = true;
+    } else if ((local.updatedAt || 0) > (remote.updatedAt || 0)) {
+      toCloud(push(local)); // שינוי מקומי שנעשה בלי רשת
+    }
+  }
+  for (const local of [...list]) {
+    if (remoteMap[local.id]) continue;
+    if (local._synced) {
+      // נמחק ממכשיר אחר
+      list.splice(list.indexOf(local), 1);
+      await db.del(store, local.id);
+      changed = true;
+    } else {
+      toCloud(push(local)); // נוצר במכשיר הזה כשלא היה חיבור
+    }
+  }
+  return changed;
+}
+
+async function withPhotos(remote, local) {
+  const r = normalizeReport(remote);
+  const localSrc = new Map((local?.photos || []).map((p) => [p.id, p.src]));
+  for (const p of r.photos) {
+    p._up = true;
+    p.src = localSrc.get(p.id) || (await cloud.fetchPhoto(p.id).catch(() => null)) || '';
+  }
+  r.photos = r.photos.filter((p) => p.src);
+  return r;
+}
+
+function startCloudSync(user) {
+  cloud.startSync(user.uid, {
+    async settings(remote) {
+      if (remote && (remote.updatedAt || 0) > (state.settings.updatedAt || 0)) {
+        state.settings = normalizeSettings(remote);
+        await db.setKV('settings', state.settings);
+        scheduleRender();
+      } else if (!remote || (state.settings.updatedAt || 0) > (remote.updatedAt || 0)) {
+        toCloud(cloud.pushSettings(state.settings));
+      }
+    },
+    async sites(map) {
+      const changed = await mergeCollection('sites', state.sites, map, { onApply: (x) => x, push: pushSiteNow });
+      if (changed) scheduleRender();
+    },
+    async reports(map) {
+      const changed = await mergeCollection('reports', state.reports, map, { onApply: withPhotos, push: pushReportNow });
+      if (changed) scheduleRender();
+    },
+    connection(online) {
+      state.online = online;
+      updateSyncBadge();
+    },
+    error(err) {
+      console.error(err);
+      toast('אין הרשאת גישה לנתונים בענן — בדוק את כללי ה-Database', 'danger');
+    },
+  });
+}
+
+function updateSyncBadge() {
+  const el = document.getElementById('sync');
+  if (!el) return;
+  el.hidden = !state.user;
+  el.className = `sync ${state.online ? 'on' : 'off'}`;
+  el.title = state.online ? 'מחובר — הנתונים נשמרים בענן' : 'אין חיבור — הנתונים נשמרים במכשיר ויסונכרנו כשהחיבור יחזור';
+  el.querySelector('span').textContent = state.online ? 'מסונכרן' : 'לא מקוון';
 }
 
 // ---------------- utils ----------------
@@ -94,7 +260,7 @@ function readFileAsDataURL(file) {
   });
 }
 
-async function compressImage(file, max = 1600, type = 'image/jpeg', quality = 0.82) {
+async function compressImage(file, max = 1400, type = 'image/jpeg', quality = 0.78) {
   const url = await readFileAsDataURL(file);
   const img = new Image();
   await new Promise((r, j) => ((img.onload = r), (img.onerror = j), (img.src = url)));
@@ -582,8 +748,17 @@ function viewSettings() {
     <label class="field"><span>סיכום מקצועי (ברירת מחדל לדוח ביקור)</span><textarea data-setbind="defaultSummary" rows="6">${esc(st.defaultSummary)}</textarea></label>
   </section>
   <section class="panel">
+    <h2 class="panel-h">חשבון</h2>
+    <div class="account">
+      <span class="avatar">${esc((state.user.displayName || state.user.email || '?').trim()[0].toUpperCase())}</span>
+      <span class="row-main"><b>${esc(state.user.displayName || '')}</b><small dir="ltr">${esc(state.user.email || '')}</small></span>
+      <button class="btn small" data-action="logout">התנתק</button>
+    </div>
+    <p class="muted tiny">הנתונים נשמרים בענן ומסונכרנים בין כל המכשירים שמחוברים לחשבון הזה, ונשמר גם עותק במכשיר לעבודה בלי קליטה.</p>
+  </section>
+  <section class="panel">
     <h2 class="panel-h">גיבוי ונתונים</h2>
-    <p class="muted">כל הנתונים נשמרים רק במכשיר הזה. מומלץ לגבות מדי פעם, ולהשתמש בגיבוי כדי להעביר נתונים בין טלפון למחשב.</p>
+    <p class="muted">אפשר להוריד עותק של כל הנתונים לקובץ, לשמירה או להעברה לחשבון אחר.</p>
     <div class="row-btns">
       <button class="btn" data-action="backup">⬇ הורד גיבוי</button>
       <button class="btn" data-action="restore">⬆ שחזר מגיבוי</button>
@@ -599,7 +774,38 @@ function notFound() {
 
 // ---------------- router ----------------
 let current = { route: '', args: [] };
+let authMode = 'login';
+function viewLogin() {
+  const signup = authMode === 'signup';
+  return `
+  <section class="auth">
+    <div class="auth-brand"><span class="brand-mark">◆</span> בקר</div>
+    <h1>${signup ? 'יצירת חשבון' : 'התחברות'}</h1>
+    <p class="muted">מערכת דוחות לבקר בטיחות באתרי בנייה. הדוחות נשמרים בחשבון שלך וזמינים מכל מכשיר.</p>
+    <button class="btn google full" data-action="google-login"><span class="g">G</span> המשך עם Google</button>
+    <div class="or"><span>או עם אימייל</span></div>
+    <form class="auth-form" data-action="${signup ? 'signup' : 'login'}">
+      ${signup ? '<label class="field"><span>שם מלא</span><input name="name" autocomplete="name" required></label>' : ''}
+      <label class="field"><span>אימייל</span><input name="email" type="email" dir="ltr" autocomplete="email" inputmode="email" required></label>
+      <label class="field"><span>סיסמה</span><input name="password" type="password" dir="ltr" autocomplete="${signup ? 'new-password' : 'current-password'}" minlength="6" required></label>
+      <p class="auth-error" id="auth-error" role="alert"></p>
+      <button class="btn primary full">${signup ? 'צור חשבון' : 'התחבר'}</button>
+    </form>
+    <div class="auth-links">
+      ${signup ? '<button class="link" data-action="auth-mode" data-mode="login">כבר יש לי חשבון — התחברות</button>'
+        : '<button class="link" data-action="auth-mode" data-mode="signup">אין לך חשבון? הרשמה</button><button class="link" data-action="reset-password">שכחתי סיסמה</button>'}
+    </div>
+  </section>`;
+}
+
 function render() {
+  if (!state.user) {
+    $view.innerHTML = state.user === undefined ? '<div class="splash"><span class="brand-mark">◆</span></div>' : viewLogin();
+    document.body.classList.add('logged-out');
+    updateSyncBadge();
+    return;
+  }
+  document.body.classList.remove('logged-out');
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
   const [route = '', ...args] = parts;
   current = { route, args };
@@ -762,16 +968,13 @@ const actions = {
   async 'delete-site'(el) {
     const n = state.reports.filter((r) => r.siteId === el.dataset.site).length;
     if (!confirm(n ? `למחוק את האתר ואת ${n} הדוחות שלו?` : 'למחוק את האתר?')) return;
-    for (const r of state.reports.filter((x) => x.siteId === el.dataset.site)) await db.del('reports', r.id);
-    await db.del('sites', el.dataset.site);
-    await load();
+    await deleteSite(el.dataset.site);
     location.hash = '#/sites';
   },
   async 'delete-report'() {
     const r = report(current.args[0]);
     if (!confirm('למחוק את הדוח לצמיתות?')) return;
-    await db.del('reports', r.id);
-    state.reports = state.reports.filter((x) => x !== r);
+    await deleteReport(r);
     location.hash = '#/';
   },
   tri(el) {
@@ -839,8 +1042,9 @@ const actions = {
   },
   async 'del-photo'(el) {
     const r = report(current.args[0]);
-    r.photos.splice(+el.dataset.i, 1);
+    const [removed] = r.photos.splice(+el.dataset.i, 1);
     await saveReport(r);
+    if (removed) toCloud(cloud.removePhoto(removed.id));
     rerender();
   },
   'sign-here'() {
@@ -950,15 +1154,43 @@ const actions = {
     inp.accept = 'application/json,.json';
     inp.onchange = async () => {
       try {
-        await importBackup(JSON.parse(await inp.files[0].text()));
-        await load();
-        toast('הגיבוי שוחזר ✓');
+        await importData(parseBackup(JSON.parse(await inp.files[0].text())));
+        toast('הגיבוי שוחזר ונשמר בענן ✓');
         rerender();
       } catch (err) {
         toast(err.message || 'שחזור נכשל', 'danger');
       }
     };
     inp.click();
+  },
+  'auth-mode'(el) {
+    authMode = el.dataset.mode;
+    render();
+  },
+  async 'google-login'(el) {
+    busy(el, true);
+    try {
+      await cloud.signInGoogle();
+    } catch (err) {
+      showAuthError(err);
+    } finally {
+      busy(el, false);
+    }
+  },
+  async 'reset-password'() {
+    const email = document.querySelector('.auth-form [name=email]')?.value.trim();
+    if (!email) return showAuthError({ message: 'הזן את האימייל שלך בשדה למעלה ולחץ שוב' });
+    try {
+      await cloud.resetPassword(email);
+      toast('נשלח מייל לאיפוס סיסמה ✓');
+    } catch (err) {
+      showAuthError(err);
+    }
+  },
+  async logout() {
+    if (!confirm('להתנתק מהחשבון? הנתונים שמורים בענן ויחכו לך בהתחברות הבאה.')) return;
+    await cloud.logOut();
+    location.hash = '#/';
   },
   theme() {
     const cur = document.documentElement.dataset.theme || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
@@ -986,8 +1218,29 @@ document.addEventListener('keydown', (e) => {
     actions['mx-cell'](cell);
   }
 });
+function showAuthError(err) {
+  const el = document.getElementById('auth-error');
+  if (el) el.textContent = cloud.authError(err);
+  else toast(cloud.authError(err), 'danger');
+}
+
 document.addEventListener('submit', async (e) => {
   const form = e.target;
+  if (form.dataset.action === 'login' || form.dataset.action === 'signup') {
+    e.preventDefault();
+    const f = new FormData(form);
+    const btn = form.querySelector('button');
+    busy(btn, true);
+    try {
+      if (form.dataset.action === 'signup') await cloud.signUp(f.get('email').trim(), f.get('password'), f.get('name')?.trim());
+      else await cloud.signIn(f.get('email').trim(), f.get('password'));
+    } catch (err) {
+      showAuthError(err);
+    } finally {
+      busy(btn, false);
+    }
+    return;
+  }
   if (form.dataset.action !== 'new-site-report') return;
   e.preventDefault();
   const name = new FormData(form).get('name').trim();
@@ -1003,10 +1256,37 @@ window.addEventListener('hashchange', () => {
   window.scrollTo(0, 0);
 });
 
-(async function boot() {
-  await load();
-  render();
-  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
-    navigator.serviceWorker.register('sw.js').catch(() => {});
+window.addEventListener('online', () => ((state.online = true), updateSyncBadge()));
+window.addEventListener('offline', () => ((state.online = false), updateSyncBadge()));
+
+// כל שינוי במצב ההתחברות: טוענים את העותק המקומי של המשתמש מיד, ואז מתחברים לענן
+cloud.onUser(async (user) => {
+  cloud.stopSync();
+  if (!user) {
+    state.user = null;
+    await useDatabase(null);
+    Object.assign(state, { sites: [], reports: [], settings: normalizeSettings(null) });
+    render();
+    return;
   }
-})();
+  await useDatabase(user.uid);
+  await load();
+  state.user = user;
+  // משתמש חדש: ממלאים שם ואימייל מהחשבון, ומעבירים נתונים שנשמרו במכשיר לפני ההתחברות לענן
+  const ins = state.settings.inspector;
+  if (!ins.name && user.displayName) ins.name = user.displayName;
+  if (!ins.email && user.email) ins.email = user.email;
+  const legacy = await takeLegacyData().catch(() => null);
+  if (legacy) {
+    await importData(legacy);
+    await dropLegacyData();
+    toast(`הועברו לחשבון ${legacy.reports.length} דוחות ו-${legacy.sites.length} אתרים מהמכשיר`);
+  }
+  render();
+  startCloudSync(user);
+});
+
+if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+render();

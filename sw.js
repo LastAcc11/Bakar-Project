@@ -1,9 +1,10 @@
 // Service worker — מאפשר עבודה גם בלי קליטה באתר הבנייה (offline) והתקנה כאפליקציה.
-const CACHE = 'bakar-v1';
+const CACHE = 'bakar-v2';
 const ASSETS = [
   './', 'index.html', 'manifest.webmanifest', 'css/app.css', 'css/paper.css',
   'js/app.js', 'js/db.js', 'js/templates.js', 'js/model.js', 'js/render-html.js',
-  'js/export-docx.js', 'js/export-pdf.js', 'js/signature.js',
+  'js/export-docx.js', 'js/export-pdf.js', 'js/signature.js', 'js/cloud.js', 'js/firebase-config.js',
+  'vendor/firebase/firebase-app.js', 'vendor/firebase/firebase-auth.js', 'vendor/firebase/firebase-database.js', 'vendor/firebase/firebase-analytics.js',
   'vendor/docx.min.js', 'vendor/jspdf.umd.min.js', 'vendor/bidi.min.mjs',
   'vendor/fonts/LiberationSans-Regular.ttf', 'vendor/fonts/LiberationSans-Bold.ttf', 'vendor/fonts/LiberationSans-Italic.ttf', 'vendor/fonts/LiberationSans-BoldItalic.ttf', 'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png',
 ];
@@ -18,13 +19,17 @@ self.addEventListener('activate', (e) => {
   );
 });
 
-// network-first לקבצי האפליקציה (כדי לקבל עדכונים), עם נפילה ל-cache כשאין רשת
+// network-first לקבצי האפליקציה (כדי לקבל עדכונים), עם נפילה ל-cache כשאין רשת.
+// בקשות ל-Firebase (התחברות/מסד נתונים) לא עוברות דרך ה-cache.
 self.addEventListener('fetch', (e) => {
   if (e.request.method !== 'GET') return;
+  const url = new URL(e.request.url);
+  const isFont = url.hostname.endsWith('fonts.googleapis.com') || url.hostname.endsWith('fonts.gstatic.com');
+  if (url.origin !== location.origin && !isFont) return;
   e.respondWith(
     fetch(e.request)
       .then((res) => {
-        if (res.ok && (new URL(e.request.url).origin === location.origin || e.request.url.includes('fonts.g'))) {
+        if (res.ok) {
           const copy = res.clone();
           caches.open(CACHE).then((c) => c.put(e.request, copy));
         }

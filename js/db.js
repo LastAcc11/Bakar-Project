@@ -1,30 +1,41 @@
-// אחסון מקומי בדפדפן (IndexedDB) — הנתונים לא יוצאים מהמכשיר.
-const DB_NAME = 'bakar';
+// אחסון מקומי בדפדפן (IndexedDB). משמש כעותק מקומי של הנתונים מהענן — כך האפליקציה נפתחת מיד
+// ועובדת גם בלי קליטה באתר. לכל משתמש מסד נפרד, כך שמשתמשים שונים על אותו מכשיר לא מתערבבים.
+const LEGACY_DB = 'bakar';
 const DB_VERSION = 1;
 const STORES = ['sites', 'reports', 'kv'];
 
+let dbName = LEGACY_DB;
 let dbPromise;
+
+function openDb(name) {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(name, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const d = req.result;
+      for (const s of STORES) {
+        if (!d.objectStoreNames.contains(s)) d.createObjectStore(s, { keyPath: s === 'kv' ? 'key' : 'id' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
 function open() {
-  if (!dbPromise) {
-    dbPromise = new Promise((resolve, reject) => {
-      const req = indexedDB.open(DB_NAME, DB_VERSION);
-      req.onupgradeneeded = () => {
-        const db = req.result;
-        for (const s of STORES) {
-          if (!db.objectStoreNames.contains(s)) db.createObjectStore(s, { keyPath: s === 'kv' ? 'key' : 'id' });
-        }
-      };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-  }
-  return dbPromise;
+  return (dbPromise ??= openDb(dbName));
+}
+
+export async function useDatabase(userId) {
+  const name = userId ? `bakar-${userId}` : LEGACY_DB;
+  if (name === dbName && dbPromise) return;
+  if (dbPromise) (await dbPromise).close();
+  dbName = name;
+  dbPromise = null;
 }
 
 async function tx(store, mode, fn) {
-  const db = await open();
+  const d = await open();
   return new Promise((resolve, reject) => {
-    const t = db.transaction(store, mode);
+    const t = d.transaction(store, mode);
     const result = fn(t.objectStore(store));
     t.oncomplete = () => resolve(result && 'result' in result ? result.result : result);
     t.onerror = () => reject(t.error);
@@ -44,6 +55,28 @@ export const db = {
   setKV: (key, value) => db.put('kv', { key, value }),
 };
 
+// נתונים שנשמרו במכשיר לפני שהיה חיבור לענן (גרסה ללא התחברות) — מועברים פעם אחת לחשבון הראשון שמתחבר
+export async function takeLegacyData() {
+  if (!indexedDB.databases) return null;
+  const list = await indexedDB.databases();
+  if (!list.some((d) => d.name === LEGACY_DB)) return null;
+  const legacy = await openDb(LEGACY_DB);
+  const read = (store) =>
+    new Promise((res, rej) => {
+      const r = legacy.transaction(store, 'readonly').objectStore(store).getAll();
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+  const data = { sites: await read('sites'), reports: await read('reports'), kv: await read('kv') };
+  legacy.close();
+  if (!data.sites.length && !data.reports.length) return null;
+  return data;
+}
+export const dropLegacyData = () => new Promise((res) => {
+  const r = indexedDB.deleteDatabase(LEGACY_DB);
+  r.onsuccess = r.onerror = r.onblocked = () => res();
+});
+
 export function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
@@ -59,9 +92,7 @@ export async function exportBackup() {
   };
 }
 
-export async function importBackup(data) {
+export function parseBackup(data) {
   if (!data || data.app !== 'bakar') throw new Error('קובץ גיבוי לא תקין');
-  for (const store of STORES) {
-    for (const row of data[store] || []) await db.put(store, row);
-  }
+  return data;
 }

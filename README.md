@@ -24,10 +24,34 @@
 - **מטריצת סיכון אינטראקטיבית**: מקישים על תא, ורואים מיד את הציון ואת רמת הסיכון בצבעי הלוח המקורי.
 - **חתימה דיגיטלית** (באצבע או בעכבר), **לוגו חברה** בכותרת, **תמונות מהשטח** בנספח (צילום ישיר מהטלפון).
 - **הפקה**: PDF וקטורי (טקסט חד שאפשר לחפש בו) ו-Word שאפשר לערוך, שניהם מימין לשמאל. בטלפון, "שיתוף" שולח את ה-PDF ישר לוואטסאפ או למייל.
-- **פרטיות**: כל הנתונים נשמרים רק במכשיר (IndexedDB). אין שרת ואין חשבון. יש גיבוי ושחזור לקובץ, וכך אפשר גם להעביר נתונים בין מכשירים.
-- **PWA**: אפשר "להוסיף למסך הבית" ולעבוד אופליין.
+- **חשבונות וענן (Firebase)**: כל משתמש מתחבר עם Google או עם אימייל וסיסמה. הנתונים שלו נשמרים בענן ומסונכרנים בין הטלפון למחשב,
+  ואף משתמש לא רואה נתונים של משתמש אחר.
+- **עבודה בלי קליטה**: יש עותק מקומי במכשיר, ולכן האפליקציה נפתחת מיד ושומרת גם בלי אינטרנט. כשהחיבור חוזר, השינויים עולים לענן.
+- **PWA**: אפשר "להוסיף למסך הבית" ולהשתמש בזה כמו באפליקציה.
 
-## הרצה
+## הגדרת Firebase (פעם אחת, ב-[Firebase Console](https://console.firebase.google.com/project/bakar-project))
+
+1. **Authentication** → Get started → **Sign-in method**: להפעיל **Email/Password** ו-**Google**.
+2. **Authentication** → **Settings** → **Authorized domains**: להוסיף את הדומיין שבו האתר מתפרסם (למשל `lastacc11.github.io`).
+3. **Realtime Database** → **Rules**: להדביק את התוכן של [`database.rules.json`](database.rules.json) וללחוץ Publish.
+   הכללים קובעים שכל משתמש יכול לקרוא ולכתוב רק תחת `users/<המזהה שלו>`.
+
+ההגדרות של הפרויקט נמצאות ב-[`js/firebase-config.js`](js/firebase-config.js). ה-SDK של Firebase נמצא בתיקייה `vendor/firebase` ונטען מקומית, כדי שהאפליקציה תעבוד גם אופליין.
+
+## פרסום
+
+**GitHub Pages** (חינם, הכי פשוט): ב-GitHub נכנסים ל-Settings → Pages → Source: *Deploy from a branch*,
+ובוחרים את הענף `claude/loving-euler-km4r96` ואת התיקייה `/ (root)`. אחרי דקה-שתיים האתר זמין בכתובת:
+**https://lastacc11.github.io/Bakar-Project/**
+
+**Firebase Hosting** (חלופה, הכתובת תהיה `https://bakar-project.web.app`):
+```bash
+npm i -g firebase-tools
+firebase login
+firebase deploy        # מפרסם את האתר וגם את כללי ה-Database
+```
+
+## הרצה מקומית
 
 אין שלב בנייה. כל הקבצים סטטיים.
 
@@ -36,8 +60,6 @@ python3 -m http.server 8000
 # ואז לפתוח http://localhost:8000
 ```
 
-כדי לפרסם, מספיק להעלות את התיקייה לכל אחסון סטטי: GitHub Pages, Netlify, Cloudflare Pages וכדומה.
-צריך HTTPS כדי שהתקנה כאפליקציה ועבודה אופליין יפעלו.
 
 ## מבנה הקוד
 
@@ -51,10 +73,14 @@ js/render-html.js     מודל → תצוגה מקדימה (HTML)
 js/export-pdf.js      מודל → PDF (jsPDF + bidi + גופן עברי מוטמע)
 js/export-docx.js     מודל → Word (ספריית docx)
 js/app.js             ממשק, ניווט, שמירה אוטומטית
-js/db.js              אחסון מקומי + גיבוי
+js/cloud.js           Firebase: התחברות וסנכרון לענן
+js/firebase-config.js הגדרות פרויקט ה-Firebase
+js/db.js              עותק מקומי במכשיר (IndexedDB) + גיבוי
 js/signature.js       משטח חתימה
 sw.js                 עבודה אופליין
-vendor/               ספריות צד שלישי (docx, jsPDF, bidi-js, גופן Liberation Sans, רישיון OFL)
+vendor/               ספריות צד שלישי (Firebase, docx, jsPDF, bidi-js, גופן Liberation Sans, רישיון OFL)
+database.rules.json   כללי האבטחה של ה-Database
+firebase.json         הגדרות לפרסום ב-Firebase Hosting
 ```
 
 כל שלושת הפורמטים (תצוגה, PDF ו-Word) נבנים מאותו מודל, ולכן התוכן שלהם תמיד זהה.
