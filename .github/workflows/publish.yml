@@ -1,0 +1,18 @@
+# מפרסם אוטומטית לאתר (GitHub Pages) כל עדכון שנדחף לענף הראשי של הפרויקט
+name: Publish site
+on:
+  push:
+    branches: [claude/loving-euler-km4r96]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency: publish
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Update gh-pages
+        run: git push origin HEAD:refs/heads/gh-pages --force

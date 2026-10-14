@@ -40,9 +40,10 @@
 
 ## פרסום
 
-**GitHub Pages** (חינם, הכי פשוט): ב-GitHub נכנסים ל-Settings → Pages → Source: *Deploy from a branch*,
-ובוחרים את הענף `claude/loving-euler-km4r96` ואת התיקייה `/ (root)`. אחרי דקה-שתיים האתר זמין בכתובת:
-**https://lastacc11.github.io/Bakar-Project/**
+**האתר פעיל בכתובת: https://lastacc11.github.io/Bakar-Project/**
+
+הוא מתארח ב-GitHub Pages מהענף `gh-pages`. כל עדכון שנדחף לענף `claude/loving-euler-km4r96` מתפרסם אוטומטית
+תוך דקה-שתיים, באמצעות [`.github/workflows/publish.yml`](.github/workflows/publish.yml).
 
 **Firebase Hosting** (חלופה, הכתובת תהיה `https://bakar-project.web.app`):
 ```bash
