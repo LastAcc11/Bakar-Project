@@ -8,7 +8,7 @@
     "ignore": [
       "firebase.json",
       "database.rules.json",
-      "README.md",
+      "README.md", "scripts/**",
       ".git/**",
       ".github/**",
       "**/.*",
