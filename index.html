@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>בקר — דוחות בקר בטיחות</title>
+  <meta name="description" content="מערכת להפקת דוחות בקר בטיחות באתרי בנייה — דוח ממצאי ביקור והודעת סיכון בלתי קביל, ב-PDF וב-Word.">
+  <meta name="theme-color" content="#1f1e1b">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/app.css">
+  <link rel="stylesheet" href="css/paper.css">
+  <script>
+    try { const t = localStorage.getItem('bakar-theme'); if (t) document.documentElement.dataset.theme = t; } catch {}
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/"><span class="brand-mark">◆</span><span class="brand-name">בקר</span></a>
+    <span class="crumb" id="crumb">~</span>
+    <nav class="nav" aria-label="ניווט ראשי">
+      <a href="#/" data-route="home"><span class="nav-ico">⌂</span><span>בית</span></a>
+      <a href="#/new/visit" data-route="new"><span class="nav-ico">＋</span><span>דוח חדש</span></a>
+      <a href="#/sites" data-route="sites"><span class="nav-ico">▦</span><span>אתרים</span></a>
+      <a href="#/reports" data-route="reports"><span class="nav-ico">≡</span><span>דוחות</span></a>
+      <a href="#/settings" data-route="settings"><span class="nav-ico">⚙</span><span>הגדרות</span></a>
+    </nav>
+  </header>
+
+  <main id="view" class="container"></main>
+
+  <dialog id="sig-dialog" class="sig-dialog">
+    <h2>חתימה</h2>
+    <p class="muted">חתום באצבע, בעט או בעכבר בתוך המסגרת</p>
+    <canvas class="sig-canvas"></canvas>
+    <div class="row-btns">
+      <button class="btn primary" data-sig="save">שמור חתימה</button>
+      <button class="btn" data-sig="clear">נקה</button>
+      <button class="btn ghost" data-sig="cancel">ביטול</button>
+    </div>
+  </dialog>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+
+  <script src="vendor/docx.min.js"></script>
+  <script src="vendor/jspdf.umd.min.js"></script>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
