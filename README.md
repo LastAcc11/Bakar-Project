@@ -40,17 +40,16 @@
 
 ## פרסום
 
-**האתר פעיל בכתובת: https://lastacc11.github.io/Bakar-Project/**
+**האתר פעיל בכתובת: https://bakar-reports.web.app** (Firebase Hosting)
 
-הוא מתארח ב-GitHub Pages מהענף `gh-pages`. כל עדכון שנדחף לענף `claude/loving-euler-km4r96` מתפרסם אוטומטית
-תוך דקה-שתיים, באמצעות [`.github/workflows/publish.yml`](.github/workflows/publish.yml).
+כתובת גיבוי ב-GitHub Pages: https://lastacc11.github.io/Bakar-Project/
 
-**Firebase Hosting** (חלופה, הכתובת תהיה `https://bakar-project.web.app`):
-```bash
-npm i -g firebase-tools
-firebase login
-firebase deploy        # מפרסם את האתר וגם את כללי ה-Database
-```
+כל עדכון שנדחף לענף `claude/loving-euler-km4r96` מתפרסם אוטומטית בשתי הכתובות דרך
+[`.github/workflows/publish.yml`](.github/workflows/publish.yml). הפרסום ל-Firebase מתחבר ל-Google בלי סיסמאות שמורות
+(Workload Identity Federation): רק הריפו הזה מורשה, ורק לפרסום האתר, דרך חשבון השירות
+`github-deploy@bakar-project.iam.gserviceaccount.com` עם התפקיד Firebase Hosting Admin.
+
+פרסום ידני מהמחשב (אם צריך): `npm i -g firebase-tools`, אחר כך `firebase login`, ואז `firebase deploy --only hosting`.
 
 ## הרצה מקומית
 

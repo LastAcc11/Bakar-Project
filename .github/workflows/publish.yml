@@ -1,15 +1,37 @@
-# מפרסם אוטומטית לאתר (GitHub Pages) כל עדכון שנדחף לענף הראשי של הפרויקט
+# מפרסם אוטומטית כל עדכון שנדחף לענף הראשי:
+#  - Firebase Hosting  → https://bakar-reports.web.app  (הכתובת הראשית)
+#  - GitHub Pages      → https://lastacc11.github.io/Bakar-Project/  (גיבוי)
+# ההתחברות ל-Google נעשית בלי סיסמאות שמורות (Workload Identity Federation): רק הריפו הזה מורשה,
+# ורק לפרסום האתר (תפקיד Firebase Hosting Admin).
 name: Publish site
 on:
   push:
     branches: [claude/loving-euler-km4r96]
   workflow_dispatch:
-permissions:
-  contents: write
 concurrency: publish
+
 jobs:
-  publish:
+  firebase:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/637444149566/locations/global/workloadIdentityPools/github/providers/bakar-repo
+          service_account: github-deploy@bakar-project.iam.gserviceaccount.com
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Deploy to Firebase Hosting
+        run: npx --yes firebase-tools@13.29.1 deploy --only hosting --project bakar-project --non-interactive
+
+  github-pages:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
