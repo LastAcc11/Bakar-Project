@@ -1,8 +1,7 @@
-// בונה "מודל מסמך" אחד מהדוח. ממנו מיוצרים גם התצוגה/PDF (render-html) וגם קובץ ה-Word (export-docx),
-// כך ששני הפורמטים תמיד זהים בתוכן ובמבנה.
+// בונה "מודל מסמך" אחד מהדוח. ממנו מיוצרים גם התצוגה/PDF (render-html, export-pdf) וגם קובץ ה-Word (export-docx),
+// כך שכל הפורמטים תמיד זהים בתוכן ובמבנה.
 import {
-  REGULATION, ROLES, REPORT_TYPES, VISIT_REASONS, PRESTART_DOCS, PRESTART_CHECKS,
-  DECLARATION, DEFAULT_SUMMARY, riskLevel,
+  REGULATION, ROLES, REPORT_TYPES, VISIT_REASONS, DECLARATION, DEFAULT_SUMMARY, finalRisk, LEVEL_INFO,
 } from './templates.js';
 
 export function formatDate(iso) {
@@ -11,17 +10,54 @@ export function formatDate(iso) {
   return `${d}/${m}/${y}`;
 }
 
-function contactLine(c) {
-  if (!c) return '';
-  return typeof c === 'string' ? c : c.name || '';
+export const contactOf = (s, role) => (typeof s?.[role] === 'object' && s[role] ? s[role] : { name: s?.[role] || '' });
+
+// "שם, ח.פ./ת.ז. 123" + שורת פרטי התקשרות (סעיפים 6–7)
+function contactText(c, withReach) {
+  let t = c.name || '';
+  if (c.idNumber) t += `${t ? ', ' : ''}ח.פ./ת.ז. ${c.idNumber}`;
+  if (withReach) {
+    const reach = [c.phone && `וואטסאפ/טל': ${c.phone}`, c.email && `דוא"ל: ${c.email}`].filter(Boolean).join(' | ');
+    if (reach) t += `${t ? '\n' : ''}${reach}`;
+  }
+  return t;
 }
 
-function compileNotes(rows, freeText) {
-  const lines = rows
-    .filter((r) => r.status === 'bad' && (r.note || '').trim())
-    .map((r) => `• ${r.label}: ${r.note.trim()}`);
-  if ((freeText || '').trim()) lines.push(freeText.trim());
+function compileNotes(sec) {
+  const lines = sec.rows
+    .filter((r) => !r.hidden && !r.header && (r.note || '').trim())
+    .map((r) => {
+      const st = r.status && r.status !== 'bad' ? ` (${sec.labels[r.status]})` : '';
+      return `• ${r.label}${st}: ${r.note.trim()}`;
+    });
+  if ((sec.text || '').trim()) lines.push(sec.text.trim());
   return lines.join('\n');
+}
+
+// תמונות שצולמו מתוך שורה/סעיף מוצגות בגוף הדוח, ליד הסעיף (סעיף 9); השאר בנספח
+function photosFor(photos, used, match) {
+  const list = photos.filter((p) => p.ref && !used.has(p.id) && match(p.ref));
+  list.forEach((p) => used.add(p.id));
+  return list;
+}
+
+function sectionBlocks(sec, photos, used, { blankLines }) {
+  const out = [];
+  const rows = sec.rows.filter((r) => !r.hidden);
+  if (sec.group) out.push({ t: 'h', num: '', text: sec.group });
+  if (sec.num) out.push({ t: 'h', num: sec.num, text: sec.title, ref: sec.ref });
+  else out.push({ t: 'sub', text: `${sec.title}:` });
+  if (rows.length) {
+    out.push({
+      t: 'tri', head: sec.head, labels: sec.labels,
+      rows: rows.map((r) => ({ label: r.label, status: r.status, level: r.level || 0, header: !!r.header })),
+    });
+  }
+  const notes = compileNotes(sec);
+  if (notes || blankLines) out.push({ t: 'text', label: sec.textLabel, value: notes });
+  const pics = photosFor(photos, used, (ref) => ref === sec.key || ref.startsWith(`${sec.key}:`));
+  if (pics.length) out.push({ t: 'photos', inline: true, label: 'תמונות לסעיף', items: pics });
+  return out;
 }
 
 export function buildModel(report, site, settings) {
@@ -29,84 +65,65 @@ export function buildModel(report, site, settings) {
   const s = site || {};
   const d = report.data;
   const inspector = report.inspector || settings.inspector || {};
+  const photos = report.photos || [];
+  const used = new Set();
   const blocks = [];
+  const title = report.type === 'custom' ? d.formTitle || 'דו"ח' : T.title;
 
   blocks.push({
     t: 'meta',
     date: formatDate(report.reportDate),
     number: report.number || '',
-    to: T.recipients.map((r) => ROLES[r]),
+    to: T.recipients.map((role) => {
+      const c = contactText(contactOf(s, role), false);
+      return c ? `${ROLES[role]} – ${c}` : ROLES[role];
+    }),
   });
-  blocks.push({ t: 'title', text: T.title, site: s.name || 'שם אתר' });
-  blocks.push({ t: 'note', text: `בהתאם לדרישות סעיף ${T.clause} ל${REGULATION}` });
-  blocks.push({ t: 'note', text: T.distribution });
+  blocks.push({ t: 'title', text: title, site: s.name || 'שם אתר' });
+  if (report.type === 'custom') {
+    if (d.formSubtitle) blocks.push({ t: 'note', text: d.formSubtitle });
+  } else {
+    blocks.push({ t: 'note', text: `בהתאם לדרישות סעיף ${T.clause} ל${REGULATION}` });
+    blocks.push({ t: 'note', text: T.distribution });
+  }
 
   const general = [
     ['שם האתר', s.name],
     ['מען/מיקום האתר', s.address],
-    ['מזמין העבודה', contactLine(s.client)],
-    ['מבצע הבניה', contactLine(s.contractor)],
-    ['מנהל אתר', contactLine(s.siteManager)],
-    ['מנהל עבודה', contactLine(s.workManager)],
+    ...Object.keys(ROLES).map((role) => [ROLES[role], contactText(contactOf(s, role), true)]),
     ['תאריך הביקור', formatDate(report.visitDate)],
   ];
+  if ((d.distMethod || '').trim()) general.push(['אופן ההפצה', d.distMethod]);
 
   if (report.type === 'visit') {
+    const [docs, checks, ...rest] = d.sections;
     blocks.push({ t: 'h', num: '1', text: '(א) נתונים כללי:' });
     blocks.push({ t: 'fields', rows: general });
-
-    blocks.push({ t: 'h', num: '', text: '(ב) שלב טרום תחילת עבודה:' });
-    blocks.push({ t: 'sub', text: 'מסמכים חובה:' });
-    blocks.push({
-      t: 'checklist',
-      items: PRESTART_DOCS.map((i) => ({ label: i.label, level: i.level || 0, checked: !!d.prestartDocs[i.id] })),
-    });
-    blocks.push({ t: 'sub', text: 'בדיקות הבקר: בקרה, ביקורת, התרעה' });
-    blocks.push({
-      t: 'checklist',
-      items: PRESTART_CHECKS.map((i) => ({ label: i.label, level: 0, checked: !!d.prestartChecks[i.id] })),
-    });
+    for (const sec of [docs, checks].filter(Boolean)) blocks.push(...sectionBlocks(sec, photos, used, { blankLines: false }));
 
     blocks.push({ t: 'h', num: '2', text: 'הגדרת הביקור', ref: "[בהתאם לדרישות סעיף 2א'(ב)(1) לתקנה]" });
     blocks.push({ t: 'sub', text: 'סיבת הביקור:' });
-    blocks.push({
-      t: 'checklist',
-      items: VISIT_REASONS.map((r) => ({ label: r.label, level: 0, checked: d.reasons.includes(r.id) })),
-    });
+    blocks.push({ t: 'checklist', items: VISIT_REASONS.map((r) => ({ label: r.label, level: 0, checked: d.reasons.includes(r.id) })) });
 
-    blocks.push({
-      t: 'h', num: '3',
-      text: 'בדיקה ואישור לקיום כלל המענים לסיכונים באתר כמפורטים בתוכנית הבטיחות בהתאמה לשלב הבניה',
-      ref: "[בהתאם לדרישות סעיף 2א'(ב)(2) לתקנה]",
-    });
-    const risks = d.risks.filter((r) => !r.other || r.label.trim() || r.status);
-    blocks.push({ t: 'tri', head: 'הנושא', rows: risks.map((r) => ({ label: r.other ? `אחר: ${r.label}` : r.label, status: r.status })) });
-    blocks.push({ t: 'text', label: 'פירוט הליקויים או מענים שאינם מיושמים', value: compileNotes(risks, d.risksText) });
-
-    blocks.push({
-      t: 'h', num: '4',
-      text: 'אספקת ציוד מיגון אישי - יש לוודא התאמה ותקינות הציוד לסוג העבודה המבוצעת',
-      ref: "[בהתאם לדרישות סעיף 2א'(ב)(2) לתקנה]",
-    });
-    blocks.push({ t: 'tri', head: 'הפריט', rows: d.ppe });
-    blocks.push({ t: 'text', label: 'פירוט הליקויים', value: compileNotes(d.ppe, d.ppeText) });
-
-    blocks.push({
-      t: 'h', num: '5', text: 'קיומן של הדרכות בטיחות באתר',
-      ref: '[בהתאם לתקנות ארגון הפיקוח על העבודה (מסירת מידע והדרכת עובדים) 1999]',
-    });
-    blocks.push({ t: 'tri', head: 'הפריט', rows: d.training });
-    blocks.push({ t: 'text', label: 'פירוט הליקויים ואיזה הדרכות חסרות?', value: compileNotes(d.training, d.trainingText) });
+    for (const sec of rest) blocks.push(...sectionBlocks(sec, photos, used, { blankLines: true }));
 
     blocks.push({ t: 'declaration', text: DECLARATION });
     const summary = d.summary ?? settings.defaultSummary ?? DEFAULT_SUMMARY;
     if ((summary || '').trim()) blocks.push({ t: 'summary', label: 'סיכום מקצועי', text: summary });
+  } else if (report.type === 'custom') {
+    blocks.push({ t: 'h', num: '1', text: 'נתונים כללי:' });
+    blocks.push({ t: 'fields', rows: general });
+    for (const sec of d.sections) blocks.push(...sectionBlocks(sec, photos, used, { blankLines: false }));
+    if ((d.summary || '').trim()) blocks.push({ t: 'text', label: d.summaryLabel || 'סיכום והערות', value: d.summary });
   } else {
     blocks.push({ t: 'h', num: '1', text: 'נתונים כללי:' });
     blocks.push({ t: 'fields', rows: general });
-    const r = riskLevel(d.severity, d.likelihood);
-    blocks.push({ t: 'matrix', sev: d.severity, lik: d.likelihood, result: r });
+    const res = finalRisk(d);
+    if (d.showMatrix !== false) blocks.push({ t: 'matrix', sev: d.severity, lik: d.likelihood, result: res });
+    else if (res) blocks.push({ t: 'text', label: 'דירוג הסיכון', value: `${LEVEL_INFO[res.level].label}${res.score && !res.manual ? ` (ציון ${res.score})` : ''}` });
     blocks.push({ t: 'text', label: 'פירוט הסיכון הבלתי קביל שנמצא', value: d.riskText });
+    const pics = photosFor(photos, used, (ref) => ref === 'risk');
+    if (pics.length) blocks.push({ t: 'photos', inline: true, label: 'תמונות הסיכון', items: pics });
     blocks.push({ t: 'text', label: 'המענה הנדרש למימוש', value: d.requiredResponse });
     blocks.push({ t: 'text', label: 'פעולות מתקנות מיידיות שבוצעו', value: d.correctiveActions });
     blocks.push({ t: 'text', label: 'ממצאים/ליקויים נוספים לדיווח', value: d.otherFindings });
@@ -120,14 +137,18 @@ export function buildModel(report, site, settings) {
     signature: inspector.signature || '',
   });
 
-  const photos = report.photos || [];
-  if (photos.length) {
-    blocks.push({ t: 'photos', label: 'נספח:', sub: 'תמונות, טפסים, תסקירים וכיוצ"ב לתיעוד', items: photos });
+  const appendix = photos.filter((p) => !used.has(p.id));
+  if (appendix.length) {
+    blocks.push({ t: 'photos', label: 'נספח:', sub: 'תמונות, טפסים, תסקירים וכיוצ"ב לתיעוד', items: appendix });
   }
+  // מספור רציף של התמונות לפי סדר הופעתן במסמך
+  let n = 0;
+  for (const b of blocks) if (b.t === 'photos') b.items = b.items.map((p) => ({ ...p, n: ++n }));
 
+  const typeName = report.type === 'custom' ? d.formTitle || 'דו"ח' : T.name;
   return {
     blocks,
-    header: { company: settings.company?.name || '', logo: settings.company?.logo || '' },
-    filename: `${T.name} - ${s.name || 'אתר'} - ${formatDate(report.visitDate || report.reportDate).replaceAll('/', '.')}`,
+    header: { company: settings.company?.name || '', logo: settings.company?.logo || '', slogan: settings.company?.slogan || '' },
+    filename: `${typeName}${report.number ? ` ${report.number}` : ''} - ${s.name || 'אתר'} - ${formatDate(report.visitDate || report.reportDate).replaceAll('/', '.')}`.replace(/[\\/:*?"<>|]/g, ''),
   };
 }

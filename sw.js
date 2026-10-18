@@ -1,5 +1,5 @@
 // Service worker — מאפשר עבודה גם בלי קליטה באתר הבנייה (offline) והתקנה כאפליקציה.
-const CACHE = 'bakar-v2';
+const CACHE = 'bakar-v3';
 const ASSETS = [
   './', 'index.html', 'manifest.webmanifest', 'css/app.css', 'css/paper.css',
   'js/app.js', 'js/db.js', 'js/templates.js', 'js/model.js', 'js/render-html.js',

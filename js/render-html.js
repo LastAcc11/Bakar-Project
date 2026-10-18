@@ -25,22 +25,26 @@ function block(b) {
       return `<h3 class="pp-sub">${esc(b.text)}</h3>`;
     case 'fields':
       return `<table class="pp-fields">${b.rows
-        .map(([k, v]) => `<tr><th>${esc(k)}:</th><td>${esc(v) || '&nbsp;'}</td></tr>`)
+        .map(([k, v]) => `<tr><th>${esc(k)}:</th><td>${multiline(v) || '&nbsp;'}</td></tr>`)
         .join('')}</table>`;
     case 'checklist':
       return `<ul class="pp-check">${b.items
         .map((i) => `<li class="lvl${i.level}">${box(i.checked)} ${esc(i.label)}</li>`)
         .join('')}</ul>`;
-    case 'tri':
+    case 'tri': {
+      const labels = b.labels || Object.fromEntries(Object.entries(STATUS).map(([k, v]) => [k, v.label]));
       return `<table class="pp-tri"><thead><tr><th>${esc(b.head)}</th>${['ok', 'bad', 'na']
-        .map((k) => `<th>${STATUS[k].label}</th>`)
+        .map((k) => `<th>${esc(labels[k])}</th>`)
         .join('')}</tr></thead><tbody>${b.rows
-        .map(
-          (r) => `<tr class="${r.status === 'bad' ? 'is-bad' : ''}"><td>${esc(r.label)}</td>${['ok', 'bad', 'na']
-            .map((k) => `<td class="c">${box(r.status === k)}</td>`)
-            .join('')}</tr>`,
+        .map((r) =>
+          r.header
+            ? `<tr class="is-group"><td colspan="4">${esc(r.label)}</td></tr>`
+            : `<tr class="${r.status === 'bad' ? 'is-bad' : ''}"><td class="lvl${r.level || 0}">${esc(r.label)}</td>${['ok', 'bad', 'na']
+                .map((k) => `<td class="c">${box(r.status === k)}</td>`)
+                .join('')}</tr>`,
         )
         .join('')}</tbody></table>`;
+    }
     case 'text':
       return `<div class="pp-text"><h3 class="pp-sub"><u>${esc(b.label)}</u></h3>${
         (b.value || '').trim()
@@ -63,9 +67,9 @@ function block(b) {
         <p><i>${esc(b.title) || 'מהנדס אזרחי/הנדסאי אזרחי/ממונה בטיחות בעל השתלמות ענפית בניה'}</i></p>
       </div>`;
     case 'photos':
-      return `<div class="pp-photos"><h3 class="pp-sub"><u>${esc(b.label)}</u></h3><p><i>${esc(b.sub)}</i></p>
+      return `<div class="pp-photos ${b.inline ? 'inline' : ''}"><h3 class="pp-sub"><u>${esc(b.label)}</u></h3>${b.sub ? `<p><i>${esc(b.sub)}</i></p>` : ''}
         <div class="pp-photo-grid">${b.items
-          .map((p, i) => `<figure><img src="${p.src}" alt=""><figcaption>תמונה ${i + 1}${p.caption ? ` — ${esc(p.caption)}` : ''}</figcaption></figure>`)
+          .map((p) => `<figure><img src="${p.src}" alt=""><figcaption>תמונה ${p.n}${p.caption ? ` — ${esc(p.caption)}` : ''}</figcaption></figure>`)
           .join('')}</div></div>`;
     default:
       return '';
@@ -99,6 +103,6 @@ export function renderPaper(model) {
   const h = model.header;
   const header = `<div class="pp-header">${
     h.logo ? `<img class="pp-logo" src="${h.logo}" alt="">` : ''
-  }${h.company ? `<span>${esc(h.company)}</span>` : ''}</div>`;
+  }${h.company || h.slogan ? `<span class="pp-co"><b>${esc(h.company)}</b>${h.slogan ? `<small>${esc(h.slogan)}</small>` : ''}</span>` : ''}</div>`;
   return `<div class="paper" dir="rtl">${header}${model.blocks.map(block).join('\n')}</div>`;
 }

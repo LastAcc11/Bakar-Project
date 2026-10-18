@@ -1,5 +1,5 @@
 // הגדרות הטפסים — הטקסטים לקוחים מהטפסים המקוריים של בקר הבטיחות.
-// כל שינוי בנוסח הדוח נעשה כאן בלבד, וזורם אוטומטית לטופס, לתצוגה, ל-PDF ול-Word.
+// הנוסח הקבוע של הדוחות נמצא כאן. רשימות הבדיקה ניתנות לעריכה גם מהממשק (בדוח עצמו ובהגדרות).
 
 export const REGULATION = 'תקנות הבטיחות (עבודות בניה ובניה הנדסית) תשמ"ח-1988';
 
@@ -27,41 +27,86 @@ export const VISIT_REASONS = [
 export const MANDATORY_STAGES = ['excavation', 'foundation', 'skeleton', 'finishing'];
 export const MAX_DAYS_BETWEEN_VISITS = 90;
 
-export const PRESTART_DOCS = [
-  { id: 'ssp', label: 'תוכנית בטיחות מאושרת (Site Safety Plan)' },
-  { id: 'clientApproval', label: 'אישור המזמין בכתב לתוכנית' },
-  { id: 'budget', label: 'הקצאת משאבים לבטיחות בחוזה' },
-  { id: 'appointments', label: 'מינוי רשמי של:' },
-  { id: 'apController', label: 'בקר בטיחות', level: 1 },
-  { id: 'apWorkManager', label: 'מנהל עבודה', level: 1 },
-  { id: 'apSafetyOfficer', label: 'ממונה בטיחות (אם נדרש לפי היקף עובדים)', level: 1 },
-  { id: 'apSiteManager', label: 'מנהל אתר (מעל 15000 מ"ר)', level: 1 },
-  { id: 'siteBook', label: 'פנקס כללי אתר' },
-  { id: 'sitePlan', label: 'תוכנית ארגון אתר (כולל תנועות, הפרדות, אזורי סיכון)' },
+// ---- רשימות הבדיקה ----
+// כל רשימה היא "סעיף" עם שורות. מוסכמה לטקסט של שורה (גם בתבניות שהמשתמש עורך בהגדרות):
+//   שורה שמתחילה ב "-"  → תת-פריט (מוזח)
+//   שורה שמסתיימת ב ":" → כותרת קבוצה (בלי סימון)
+export const STATUS_LABELS = { ok: 'תקין', bad: 'לא תקין', na: 'לא רלוונטי' };
+export const STATUS_ICONS = { ok: '✓', bad: '✗', na: '—' };
+export const STATUS = Object.fromEntries(Object.entries(STATUS_LABELS).map(([k, label]) => [k, { label, icon: STATUS_ICONS[k] }]));
+
+export const VISIT_SECTION_DEFS = [
+  {
+    key: 'docs', step: 'prestart', group: '(ב) שלב טרום תחילת עבודה:',
+    title: 'מסמכים חובה', head: 'המסמך', labels: { ok: 'יש', bad: 'אין', na: 'לא רלוונטי' },
+    textLabel: 'הערות לגבי המסמכים',
+    items: [
+      'תוכנית בטיחות מאושרת (Site Safety Plan)',
+      'אישור המזמין בכתב לתוכנית',
+      'הקצאת משאבים לבטיחות בחוזה',
+      'מינוי רשמי של:',
+      '-בקר בטיחות',
+      '-מנהל עבודה',
+      '-ממונה בטיחות (אם נדרש לפי היקף עובדים)',
+      '-מנהל אתר (מעל 15000 מ"ר)',
+      'פנקס כללי אתר',
+      'תוכנית ארגון אתר (כולל תנועות, הפרדות, אזורי סיכון)',
+    ],
+  },
+  {
+    key: 'checks', step: 'prestart',
+    title: 'בדיקות הבקר: בקרה, ביקורת, התרעה', head: 'הבדיקה', labels: { ok: 'כן', bad: 'לא', na: 'לא רלוונטי' },
+    textLabel: 'הערות לבדיקות הבקר',
+    items: [
+      'האם התוכנית מותאמת ספציפית לפרויקט (לא גנרית)',
+      'האם קיימת התאמה בין חוזה ↔ תוכנית בטיחות',
+      "האם הוגדרו סיכונים ייחודיים (גובה, עגורנים, חפירות וכו')",
+    ],
+  },
+  {
+    key: 'risks', step: 'risks', num: '3',
+    title: 'בדיקה ואישור לקיום כלל המענים לסיכונים באתר כמפורטים בתוכנית הבטיחות בהתאמה לשלב הבניה',
+    ref: "[בהתאם לדרישות סעיף 2א'(ב)(2) לתקנה]", head: 'הנושא', labels: STATUS_LABELS,
+    textLabel: 'פירוט הליקויים או מענים שאינם מיושמים',
+    items: ['ארגון אתר', 'חפירות', 'כלונסאות', 'ביסוס', 'שלד', 'גמרים', 'פיתוח חיצוני', 'חשמל',
+      'כלי צמ"ה', 'פיגומים באתר', 'עגורנים ומכונות הרמה', 'טפסות', 'מיגון מכונות וכלי עבודה'],
+  },
+  {
+    key: 'ppe', step: 'ppe', num: '4',
+    title: 'אספקת ציוד מיגון אישי - יש לוודא התאמה ותקינות הציוד לסוג העבודה המבוצעת',
+    ref: "[בהתאם לדרישות סעיף 2א'(ב)(2) לתקנה]", head: 'הפריט', labels: STATUS_LABELS,
+    textLabel: 'פירוט הליקויים',
+    items: ['כובע מגן', 'נעלי בטיחות S3', 'וסט זוהר', 'משקפי מגן', 'הגנת שמיעה', 'כפפות עבודה', 'רתמה לעבודה בגובה'],
+  },
+  {
+    key: 'training', step: 'training', num: '5',
+    title: 'קיומן של הדרכות בטיחות באתר',
+    ref: '[בהתאם לתקנות ארגון הפיקוח על העבודה (מסירת מידע והדרכת עובדים) 1999]', head: 'הפריט', labels: STATUS_LABELS,
+    textLabel: 'פירוט הליקויים ואיזה הדרכות חסרות?',
+    items: ['תמצית בכתב לעובד חדש', 'מסירת מידע בעמדת העבודה', 'הדרכה תקופתית'],
+  },
 ];
 
-export const PRESTART_CHECKS = [
-  { id: 'specific', label: 'האם התוכנית מותאמת ספציפית לפרויקט (לא גנרית)' },
-  { id: 'contractMatch', label: 'האם קיימת התאמה בין חוזה ↔ תוכנית בטיחות' },
-  { id: 'uniqueRisks', label: "האם הוגדרו סיכונים ייחודיים (גובה, עגורנים, חפירות וכו')" },
-];
+export const rid = () => Math.random().toString(36).slice(2, 9);
 
-export const RISK_TOPICS = [
-  'ארגון אתר', 'חפירות', 'כלונסאות', 'ביסוס', 'שלד', 'גמרים', 'פיתוח חיצוני', 'חשמל',
-  'כלי צמ"ה', 'פיגומים באתר', 'עגורנים ומכונות הרמה', 'טפסות', 'מיגון מכונות וכלי עבודה',
-];
+// טקסט שורה ("-פריט" / "כותרת:") → אובייקט שורה
+export function parseItem(line) {
+  const t = String(line).trim();
+  if (!t) return null;
+  const level = t.startsWith('-') ? 1 : 0;
+  const label = level ? t.slice(1).trim() : t;
+  return { id: rid(), label, status: '', note: '', level, header: !level && label.endsWith(':') };
+}
+export const itemsToText = (rows) => rows.filter((r) => !r.hidden).map((r) => (r.level ? `-${r.label}` : r.label)).join('\n');
+export const textToItems = (text) => String(text || '').split('\n').map(parseItem).filter(Boolean);
+export const defaultItemsText = (key) => VISIT_SECTION_DEFS.find((d) => d.key === key)?.items.join('\n') || '';
 
-export const PPE_ITEMS = [
-  'כובע מגן', 'נעלי בטיחות S3', 'וסט זוהר', 'משקפי מגן', 'הגנת שמיעה', 'כפפות עבודה', 'רתמה לעבודה בגובה',
-];
-
-export const TRAINING_ITEMS = ['תמצית בכתב לעובד חדש', 'מסירת מידע בעמדת העבודה', 'הדרכה תקופתית'];
-
-export const STATUS = {
-  ok: { label: 'תקין', icon: '✓' },
-  bad: { label: 'לא תקין', icon: '✗' },
-  na: { label: 'לא רלוונטי', icon: '—' },
-};
+// בונה סעיף לדוח מהגדרה. overrideItems = רשימה שהמשתמש קבע בהגדרות (אם יש)
+export function buildSection(def, overrideItems) {
+  const { items, ...meta } = def;
+  const rows = overrideItems ? textToItems(overrideItems) : items.map(parseItem).filter(Boolean);
+  return { ...meta, labels: { ...STATUS_LABELS, ...def.labels }, rows, text: '' };
+}
 
 export const DECLARATION =
   'הריני מצהיר כי בדקתי בשטח האתר אספקת הציוד מיגון אישי, ההדרכות הנדרשות לעובדים ואת יישומם של כלל המענים לכלל הסיכונים המפורטים בתוכנית הבטיחות בהתאם לשלב הבניה הנוכחי וכל התוצאות תואמות את יום תאריך בדיקת הדוח.';
@@ -102,6 +147,12 @@ export function riskLevel(sev, lik) {
   if (!sev || !lik) return null;
   return { score: sev * lik, level: LEVELS[sev][lik] };
 }
+// הדירוג הסופי: לפי הלוח, או דירוג ידני שהבקר בחר (סעיף 13)
+export function finalRisk(d) {
+  const auto = riskLevel(d.severity, d.likelihood);
+  if (!d.levelOverride) return auto && { ...auto, manual: false };
+  return { score: auto?.score ?? null, level: d.levelOverride, manual: true };
+}
 
 export const REPORT_TYPES = {
   visit: {
@@ -120,33 +171,84 @@ export const REPORT_TYPES = {
     recipients: ['client', 'contractor', 'siteManager', 'workManager'],
     deadlineHours: 0,
   },
+  custom: {
+    name: 'טופס מותאם',
+    title: '',
+    clause: '',
+    distribution: '',
+    recipients: ['client', 'contractor'],
+    deadlineHours: null,
+  },
 };
 
-export function emptyTri(labels) {
-  return labels.map((label) => ({ label, status: '', note: '' }));
+// תבנית ריקה לטופס מותאם (סעיף 20) — המשתמש קובע כותרות ופריטים
+export function newCustomForm() {
+  return {
+    id: rid(),
+    name: 'טופס חדש',
+    title: 'דו"ח ביקורת',
+    subtitle: '',
+    summaryLabel: 'סיכום והערות',
+    sections: [{ id: rid(), title: 'סעיף 1', head: 'הפריט', labels: { ...STATUS_LABELS }, textLabel: 'פירוט והערות', items: '' }],
+  };
 }
 
-export function newReportData(type) {
+export function newReportData(type, { templates = {}, form } = {}) {
   if (type === 'visit') {
     return {
-      prestartDocs: {},
-      prestartChecks: {},
+      sections: VISIT_SECTION_DEFS.map((def) => buildSection(def, templates[def.key])),
       reasons: [],
-      risks: [...emptyTri(RISK_TOPICS), { label: '', status: '', note: '', other: true }, { label: '', status: '', note: '', other: true }],
-      risksText: '',
-      ppe: emptyTri(PPE_ITEMS),
-      ppeText: '',
-      training: emptyTri(TRAINING_ITEMS),
-      trainingText: '',
       summary: null, // null = לקחת מברירת המחדל בהגדרות
+      distMethod: 'וואטסאפ / דוא"ל',
+    };
+  }
+  if (type === 'custom') {
+    const f = form || newCustomForm();
+    return {
+      formId: f.id,
+      formTitle: f.title,
+      formSubtitle: f.subtitle || '',
+      summaryLabel: f.summaryLabel || 'סיכום והערות',
+      summary: '',
+      distMethod: 'וואטסאפ / דוא"ל',
+      sections: (f.sections || []).map((sec, i) => ({
+        key: sec.id || `s${i}`, step: `s${i}`, num: String(i + 2), title: sec.title, head: sec.head || 'הפריט',
+        labels: { ...STATUS_LABELS, ...sec.labels }, textLabel: sec.textLabel || 'פירוט והערות',
+        rows: textToItems(sec.items), text: '',
+      })),
     };
   }
   return {
     severity: 0,
     likelihood: 0,
+    showMatrix: true,
+    levelOverride: '',
     riskText: '',
     requiredResponse: '',
     correctiveActions: '',
     otherFindings: '',
+    distMethod: 'וואטסאפ / דוא"ל',
   };
+}
+
+// המרה מהמבנה הישן של דוח ביקור (prestartDocs / risks / ppe / training) למבנה הסעיפים
+const OLD_DOC_IDS = ['ssp', 'clientApproval', 'budget', 'appointments', 'apController', 'apWorkManager', 'apSafetyOfficer', 'apSiteManager', 'siteBook', 'sitePlan'];
+const OLD_CHECK_IDS = ['specific', 'contractMatch', 'uniqueRisks'];
+export function migrateVisitData(d) {
+  if (d.sections) return d;
+  const fresh = newReportData('visit');
+  const [docs, checks, risks, ppe, training] = fresh.sections;
+  docs.rows.forEach((r, i) => { if (d.prestartDocs?.[OLD_DOC_IDS[i]] && !r.header) r.status = 'ok'; });
+  checks.rows.forEach((r, i) => { if (d.prestartChecks?.[OLD_CHECK_IDS[i]]) r.status = 'ok'; });
+  const copy = (sec, oldRows, text) => {
+    const list = Array.isArray(oldRows) ? oldRows : Object.values(oldRows || {});
+    sec.rows = list
+      .filter((o) => !o.other || (o.label || '').trim())
+      .map((o) => ({ id: rid(), label: o.label, status: o.status || '', note: o.note || '', level: 0, header: false }));
+    sec.text = text || '';
+  };
+  copy(risks, d.risks, d.risksText);
+  copy(ppe, d.ppe, d.ppeText);
+  copy(training, d.training, d.trainingText);
+  return { ...fresh, reasons: d.reasons || [], summary: d.summary ?? null };
 }

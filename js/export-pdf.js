@@ -187,7 +187,7 @@ class Writer {
     const total = cols.reduce((a, b) => a + b, 0);
     const right = o.right ?? RIGHT - (WIDTH - total) / 2;
     const prepared = rows.map((cells) => {
-      const laid = cells.map((c, i) => (c.runs ? this.layout(c.runs, cols[i] - pad * 2) : []));
+      const laid = cells.map((c, i) => (c.runs ? this.layout(c.runs, cols[i] - pad * 2 - (c.padRight || 0)) : []));
       const contentH = Math.max(...laid.map((ls, i) => (cells[i].box ? 3.4 : ls.reduce((a, l) => a + l.h, 0))), cells.minH || 0);
       return { cells, laid, h: Math.max(contentH + pad * 2, o.minRowH || 0) };
     });
@@ -206,7 +206,7 @@ class Writer {
           const textH = row.laid[i].reduce((a, l) => a + l.h, 0);
           let ty = this.y + (c.valign === 'top' ? pad : (row.h - textH) / 2);
           for (const line of row.laid[i]) {
-            this.drawLine(line, ty, { right: x - pad, left: cx + pad, align: c.align || 'right' });
+            this.drawLine(line, ty, { right: x - pad - (c.padRight || 0), left: cx + pad, align: c.align || 'right' });
             ty += line.h;
           }
         }
@@ -285,12 +285,15 @@ export async function exportPdf(model) {
         break;
       case 'tri': {
         const c = 24;
+        const labels = b.labels || Object.fromEntries(Object.entries(STATUS).map(([k, v]) => [k, v.label]));
         W.table([
-          [{ runs: [{ text: b.head, ...B }], fill: '#D9D9D9' }, ...['ok', 'bad', 'na'].map((k) => ({ runs: [{ text: STATUS[k].label, ...B }], align: 'center', fill: '#D9D9D9' }))],
-          ...b.rows.map((r) => [
-            { runs: [{ text: r.label, bold: r.status === 'bad' }] },
-            ...['ok', 'bad', 'na'].map((k) => ({ box: r.status === k, fill: r.status === 'bad' && k === 'bad' ? '#FDE2E1' : undefined })),
-          ]),
+          [{ runs: [{ text: b.head, ...B }], fill: '#D9D9D9' }, ...['ok', 'bad', 'na'].map((k) => ({ runs: [{ text: labels[k], ...B }], align: 'center', fill: '#D9D9D9' }))],
+          ...b.rows.map((r) => (r.header
+            ? [{ runs: [{ text: r.label, ...B }], fill: '#F2F2F2' }, { fill: '#F2F2F2', runs: [] }, { fill: '#F2F2F2', runs: [] }, { fill: '#F2F2F2', runs: [] }]
+            : [
+              { runs: [{ text: `${r.level ? '–  ' : ''}${r.label}`, bold: r.status === 'bad' }], padRight: r.level ? 6 : 0 },
+              ...['ok', 'bad', 'na'].map((k) => ({ box: r.status === k, fill: r.status === 'bad' && k === 'bad' ? '#FDE2E1' : undefined })),
+            ])),
         ], [WIDTH - c * 3, c, c, c]);
         break;
       }
@@ -391,12 +394,12 @@ export async function exportPdf(model) {
         break;
       }
       case 'photos': {
-        W.space(6);
-        W.para([{ text: b.label, ...B, underline: true }], { keepNext: true, after: 0.5 });
-        W.para([{ text: b.sub, italic: true }], { after: 3 });
+        W.space(b.inline ? 2 : 6);
+        W.para([{ text: b.label, ...B, underline: true, size: b.inline ? 10 : 11 }], { keepNext: true, after: 0.5 });
+        if (b.sub) W.para([{ text: b.sub, italic: true }], { after: 3 });
         const gap = 6;
         const cellW = (WIDTH - gap) / 2;
-        const boxH = 66;
+        const boxH = b.inline ? 52 : 66;
         for (let i = 0; i < b.items.length; i += 2) {
           W.ensure(boxH + 8);
           b.items.slice(i, i + 2).forEach((p, j) => {
@@ -407,7 +410,7 @@ export async function exportPdf(model) {
             doc.setLineWidth(0.2);
             doc.setDrawColor('#BBBBBB');
             doc.rect(x, W.y + (boxH - f.h) / 2, f.w, f.h);
-            const cap = W.layout([{ text: `תמונה ${i + j + 1}${p.caption ? ` — ${p.caption}` : ''}`, italic: true, size: 9 }], cellW)[0];
+            const cap = W.layout([{ text: `תמונה ${p.n}${p.caption ? ` — ${p.caption}` : ''}`, italic: true, size: 9 }], cellW)[0];
             W.drawLine(cap, W.y + boxH + 1, { right: xRight, left: xRight - cellW, align: 'center' });
           });
           W.y += boxH + 9;
@@ -423,15 +426,25 @@ export async function exportPdf(model) {
   for (let i = 1; i <= pages; i++) {
     doc.setPage(i);
     let hasHeader = false;
-    if (logo) {
-      const f = fit(logo, 50, 12);
-      const textW = model.header.company ? W.width(model.header.company, { bold: true, size: 10 }) + 4 : 0;
-      const total = f.w + textW;
-      doc.addImage(model.header.logo, imgFormat(model.header.logo), PAGE_W / 2 + total / 2 - f.w, 8, f.w, f.h);
-      if (textW) W.drawLine(W.layout([{ text: model.header.company, bold: true, size: 10, color: '#555555' }], WIDTH)[0], 8 + f.h / 2 - 2.5, { right: PAGE_W / 2 + total / 2 - f.w - 4 });
-      hasHeader = true;
-    } else if (model.header.company) {
-      W.drawLine(W.layout([{ text: model.header.company, bold: true, size: 10, color: '#555555' }], WIDTH)[0], 10, { align: 'center' });
+    const { company, slogan } = model.header;
+    const textRuns = [
+      ...(company ? [{ text: company, bold: true, size: 10, color: '#555555' }] : []),
+      ...(slogan ? [{ text: `${company ? '\n' : ''}${slogan}`, italic: true, size: 8.5, color: '#777777' }] : []),
+    ];
+    const lines = textRuns.length ? W.layout(textRuns, WIDTH) : [];
+    const textW = lines.length ? Math.max(...lines.map((l) => l.w)) : 0;
+    const textH = lines.reduce((a, l) => a + l.h, 0);
+    const f = logo ? fit(logo, 50, 12) : null;
+    if (f || lines.length) {
+      const total = (f ? f.w : 0) + (f && textW ? 4 : 0) + textW;
+      const right = PAGE_W / 2 + total / 2;
+      if (f) doc.addImage(model.header.logo, imgFormat(model.header.logo), right - f.w, 8, f.w, f.h);
+      let ty = 8 + Math.max(0, ((f?.h || textH) - textH) / 2);
+      const textRight = right - (f ? f.w + 4 : 0);
+      for (const l of lines) {
+        W.drawLine(l, ty, { right: textRight, left: textRight - textW, align: f ? 'right' : 'center' });
+        ty += l.h;
+      }
       hasHeader = true;
     }
     if (hasHeader) {

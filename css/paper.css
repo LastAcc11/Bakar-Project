@@ -64,3 +64,11 @@
 .mx-red { background: #ff0000; } .mx-yellow { background: #ffff00; } .mx-green { background: #00ff00; }
 .mx-cell.mx-on { outline: 5px solid #000; outline-offset: -5px; position: relative; }
 .mx-cell.mx-on::after { content: '◉'; position: absolute; right: 8px; bottom: 4px; font-size: 18px; }
+
+/* שורות קבוצה, תת-פריטים, סלוגן ותמונות בגוף הדוח */
+.pp-tri tr.is-group td { background: #f2f2f2; font-weight: 700; }
+.pp-tri td.lvl1 { padding-right: 26px; }
+.pp-co { display: flex; flex-direction: column; align-items: center; line-height: 1.3; }
+.pp-co small { font-weight: 400; font-size: 12px; font-style: italic; color: #666; }
+.pp-photos.inline { margin-top: 10px; }
+.pp-photos.inline .pp-photo-grid img { max-height: 220px; }

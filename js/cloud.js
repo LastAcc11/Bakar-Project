@@ -124,6 +124,8 @@ export function startSync(userId, handlers) {
   listeners.push(conn);
 }
 
+export const isSyncing = () => !!uid;
+
 export function stopSync() {
   listeners.splice(0).forEach((r) => off(r));
   uid = null;

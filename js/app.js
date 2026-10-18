@@ -1,10 +1,11 @@
 import { db, uid, exportBackup, parseBackup, useDatabase, takeLegacyData, dropLegacyData } from './db.js';
 import * as cloud from './cloud.js';
 import {
-  REPORT_TYPES, ROLES, VISIT_REASONS, MANDATORY_STAGES, MAX_DAYS_BETWEEN_VISITS, PRESTART_DOCS, PRESTART_CHECKS,
-  SIGNER_TITLES, DECLARATION, DEFAULT_SUMMARY, STATUS, LEVEL_INFO, SEVERITY, LIKELIHOOD, riskLevel, newReportData,
+  REPORT_TYPES, ROLES, VISIT_REASONS, MANDATORY_STAGES, MAX_DAYS_BETWEEN_VISITS, VISIT_SECTION_DEFS,
+  SIGNER_TITLES, DECLARATION, DEFAULT_SUMMARY, STATUS_ICONS, LEVEL_INFO, SEVERITY, LIKELIHOOD, finalRisk,
+  newReportData, migrateVisitData, newCustomForm, defaultItemsText, rid,
 } from './templates.js';
-import { buildModel, formatDate } from './model.js';
+import { buildModel, formatDate, contactOf } from './model.js';
 import { renderPaper, matrixTable, esc } from './render-html.js';
 import { exportDocx } from './export-docx.js';
 import { exportPdf } from './export-pdf.js';
@@ -14,42 +15,63 @@ import { SignaturePad } from './signature.js';
 // עבודה "מקומית קודם": כל שמירה נכתבת מיד למכשיר (IndexedDB) ובמקביל נשלחת לענן (Firebase).
 // שינויים שמגיעים מהענן (ממכשיר אחר) ממוזגים לפי זמן העדכון האחרון.
 const state = { settings: null, sites: [], reports: [], user: undefined, online: navigator.onLine };
+// מצב תצוגה זמני (לא נשמר)
+const ui = { editList: null, openNotes: new Set(), askSent: null, reportsMode: 'all', addRecipient: false };
 const $view = document.getElementById('view');
 const today = () => new Date().toISOString().slice(0, 10);
 const DAY = 86400000;
 const daysBetween = (a, b) => Math.floor((new Date(b) - new Date(a)) / DAY);
 const addDays = (iso, n) => new Date(new Date(iso).getTime() + n * DAY).toISOString().slice(0, 10);
+const arr = (v) => (Array.isArray(v) ? v : Object.values(v || {}));
 
 const DEFAULT_SETTINGS = {
   inspector: { name: '', title: SIGNER_TITLES[0], phone: '', email: '', signature: '' },
-  company: { name: '', logo: '' },
+  company: { name: '', slogan: '', logo: '' },
   defaultSummary: DEFAULT_SUMMARY,
+  // תפוצה: נמענים קבועים לכל סוג דוח. אם ריק — נלקחים הנמענים האחרונים ששלחת אליהם
+  distribution: { includeSelf: true, visit: [], risk: [], custom: [] },
+  lastRecipients: { visit: [], risk: [], custom: [] },
+  templates: {}, // רשימות בדיקה מותאמות לדוח ביקור, לפי מפתח סעיף
+  customForms: [],
   updatedAt: 0,
 };
 
 function normalizeSettings(saved) {
+  const s = saved || {};
+  const dist = s.distribution || {};
+  const last = s.lastRecipients || {};
   return {
-    ...DEFAULT_SETTINGS, ...saved,
-    inspector: { ...DEFAULT_SETTINGS.inspector, ...saved?.inspector },
-    company: { ...DEFAULT_SETTINGS.company, ...saved?.company },
+    ...DEFAULT_SETTINGS, ...s,
+    inspector: { ...DEFAULT_SETTINGS.inspector, ...s.inspector },
+    company: { ...DEFAULT_SETTINGS.company, ...s.company },
+    distribution: { includeSelf: dist.includeSelf !== false, visit: arr(dist.visit), risk: arr(dist.risk), custom: arr(dist.custom) },
+    lastRecipients: { visit: arr(last.visit), risk: arr(last.risk), custom: arr(last.custom) },
+    templates: s.templates || {},
+    customForms: arr(s.customForms).map((f) => ({ ...f, sections: arr(f.sections).map((x) => ({ ...x, labels: { ...x.labels } })) })),
   };
 }
 
 // Realtime Database לא שומר מערכים/אובייקטים ריקים — משלימים ברירות מחדל לדוח שהגיע מהענן
+function normalizeSections(sections) {
+  return arr(sections).map((sec) => ({
+    ...sec,
+    labels: { ok: 'תקין', bad: 'לא תקין', na: 'לא רלוונטי', ...sec.labels },
+    rows: arr(sec.rows).map((row) => ({ status: '', note: '', level: 0, ...row, id: row.id || rid() })),
+    text: sec.text || '',
+  }));
+}
 function normalizeReport(r) {
-  const base = newReportData(r.type);
-  const data = { ...base, ...r.data };
+  let data = { ...r.data };
   if (r.type === 'visit') {
-    data.prestartDocs ||= {};
-    data.prestartChecks ||= {};
-    data.reasons = Array.isArray(data.reasons) ? data.reasons : Object.values(data.reasons || {});
-    for (const k of ['risks', 'ppe', 'training']) {
-      const rows = Array.isArray(data[k]) ? data[k] : Object.values(data[k] || {});
-      data[k] = base[k].map((b, i) => ({ ...b, ...rows[i] }));
-    }
+    data = migrateVisitData(data);
+    data = { ...newReportData('visit'), ...data, sections: normalizeSections(data.sections), reasons: arr(data.reasons) };
+  } else if (r.type === 'custom') {
+    data = { ...newReportData('custom', { form: { sections: [] } }), ...data, sections: normalizeSections(data.sections) };
+  } else {
+    data = { ...newReportData('risk'), ...data };
   }
-  const photos = Array.isArray(r.photos) ? r.photos : Object.values(r.photos || {});
-  return { ...r, data, photos, inspector: r.inspector || {} };
+  const recipients = r.recipients ? arr(r.recipients) : undefined;
+  return { ...r, data, photos: arr(r.photos), inspector: r.inspector || {}, recipients };
 }
 
 async function load() {
@@ -59,6 +81,14 @@ async function load() {
 }
 const site = (id) => state.sites.find((s) => s.id === id);
 const report = (id) => state.reports.find((r) => r.id === id);
+// טיוטה שנפתחה ועוד לא נערכה לא נחשבת דוח (סעיף 18) — היא נמחקת אם יוצאים בלי לשנות דבר
+const savedReports = () => state.reports.filter((r) => !r._draft);
+const reportTitle = (r) => (r.type === 'custom' ? r.data.formTitle || 'טופס' : REPORT_TYPES[r.type].name);
+
+// ---------------- cloud on/off (נשמר במכשיר) ----------------
+const cloudEnabled = () => {
+  try { return localStorage.getItem('bakar-cloud') !== 'off'; } catch { return true; }
+};
 
 // כתיבה לענן "ברקע": אם אין רשת, ה-SDK של Firebase שומר בתור ושולח כשהחיבור חוזר
 function toCloud(promise) {
@@ -74,12 +104,15 @@ async function saveSettings() {
   toCloud(cloud.pushSettings(state.settings));
 }
 // _synced = השרת אישר שהפריט קיים בענן. פריט כזה שנעלם מהענן — נמחק ממכשיר אחר.
+// מסמנים _synced רק אם באמת נשלח (הסנכרון פעיל) — אחרת פריט שנשמר לפני ההתחברות לענן היה נחשב "נמחק במכשיר אחר"
 function pushSiteNow(s) {
+  if (!cloud.isSyncing()) return Promise.resolve();
   return cloud.pushSite(s).then(() => {
     if (!s._synced) return db.put('sites', Object.assign(s, { _synced: true }));
   });
 }
 function pushReportNow(r) {
+  if (!cloud.isSyncing()) return Promise.resolve();
   return cloud.pushReport(r).then((uploadedPhotos) => {
     if (uploadedPhotos || !r._synced) return db.put('reports', Object.assign(r, { _synced: true }));
   });
@@ -92,6 +125,7 @@ async function saveSite(s) {
 }
 async function saveReport(r) {
   r.updatedAt = Date.now();
+  delete r._draft;
   if (!state.reports.includes(r)) state.reports.push(r);
   await db.put('reports', r);
   toCloud(pushReportNow(r));
@@ -119,6 +153,7 @@ async function importData(data) {
 
 async function deleteReport(r) {
   state.reports = state.reports.filter((x) => x.id !== r.id);
+  if (r._draft) return;
   await db.del('reports', r.id);
   toCloud(cloud.removeReport(r));
 }
@@ -146,12 +181,12 @@ async function mergeCollection(store, list, remoteMap, { onApply, push }) {
       else list.push(item);
       await db.put(store, item);
       changed = true;
-    } else if ((local.updatedAt || 0) > (remote.updatedAt || 0)) {
+    } else if ((local.updatedAt || 0) > (remote.updatedAt || 0) && !local._draft) {
       toCloud(push(local)); // שינוי מקומי שנעשה בלי רשת
     }
   }
   for (const local of [...list]) {
-    if (remoteMap[local.id]) continue;
+    if (remoteMap[local.id] || local._draft) continue;
     if (local._synced) {
       // נמחק ממכשיר אחר
       list.splice(list.indexOf(local), 1);
@@ -209,9 +244,11 @@ function updateSyncBadge() {
   const el = document.getElementById('sync');
   if (!el) return;
   el.hidden = !state.user;
-  el.className = `sync ${state.online ? 'on' : 'off'}`;
-  el.title = state.online ? 'מחובר — הנתונים נשמרים בענן' : 'אין חיבור — הנתונים נשמרים במכשיר ויסונכרנו כשהחיבור יחזור';
-  el.querySelector('span').textContent = state.online ? 'מסונכרן' : 'לא מקוון';
+  const local = !cloudEnabled();
+  el.className = `sync ${local ? 'local' : state.online ? 'on' : 'off'}`;
+  el.title = local ? 'שמירה בענן כבויה — הנתונים נשמרים רק במכשיר הזה'
+    : state.online ? 'מחובר — הנתונים נשמרים בענן' : 'אין חיבור — הנתונים נשמרים במכשיר ויסונכרנו כשהחיבור יחזור';
+  el.querySelector('span').textContent = local ? 'במכשיר בלבד' : state.online ? 'מסונכרן' : 'לא מקוון';
 }
 
 // ---------------- utils ----------------
@@ -220,8 +257,8 @@ function toast(msg, kind = '') {
   el.className = `toast ${kind}`;
   el.textContent = msg;
   document.getElementById('toasts').appendChild(el);
-  setTimeout(() => el.classList.add('out'), 2600);
-  setTimeout(() => el.remove(), 3000);
+  setTimeout(() => el.classList.add('out'), 3200);
+  setTimeout(() => el.remove(), 3600);
 }
 
 function getPath(obj, path) {
@@ -291,17 +328,25 @@ function pickFiles({ multiple = true, capture = false } = {}) {
   });
 }
 
-const contactName = (c) => (typeof c === 'string' ? c : c?.name || '');
+// מספר טלפון ישראלי → פורמט בינלאומי לוואטסאפ (050-1234567 → 972501234567)
+function waNumber(phone) {
+  let d = String(phone || '').replace(/\D/g, '');
+  if (d.startsWith('00')) d = d.slice(2);
+  if (d.startsWith('0')) d = `972${d.slice(1)}`;
+  return d;
+}
+const isMobile = () => matchMedia('(pointer: coarse)').matches;
 
 // ---------------- site analytics ----------------
 function siteStats(s) {
-  const visits = state.reports.filter((r) => r.siteId === s.id && r.type === 'visit' && r.visitDate);
-  const risks = state.reports.filter((r) => r.siteId === s.id && r.type === 'risk');
+  const reps = savedReports().filter((r) => r.siteId === s.id);
+  const visits = reps.filter((r) => r.type === 'visit' && r.visitDate);
+  const risks = reps.filter((r) => r.type === 'risk');
   const stages = new Set(visits.flatMap((v) => v.data.reasons || []));
   const last = visits.map((v) => v.visitDate).sort().pop() || null;
   const due = last ? addDays(last, MAX_DAYS_BETWEEN_VISITS) : null;
   const left = due ? daysBetween(today(), due) : null;
-  return { visits, risks, stages, last, due, left };
+  return { reps, visits, risks, stages, last, due, left };
 }
 
 function dueChip(st) {
@@ -320,7 +365,7 @@ function stageDots(st) {
 function reportDeadline(r) {
   if (r.status === 'sent') return null;
   if (r.type === 'risk') return { label: 'להפצה מיידית', kind: 'danger' };
-  if (!r.visitDate) return null;
+  if (r.type !== 'visit' || !r.visitDate) return null;
   // 48 שעות ממועד הביקור — שעת הביקור לא נשמרת, לכן מחשבים לפי תאריך: עד יומיים אחרי יום הביקור
   const due = addDays(r.visitDate, REPORT_TYPES.visit.deadlineHours / 24);
   const left = daysBetween(today(), due);
@@ -328,25 +373,28 @@ function reportDeadline(r) {
   return { label: left === 0 ? 'להפצה עד היום' : `להפצה עד ${formatDate(due)}`, kind: left === 0 ? 'warn' : '' };
 }
 
-function reportRow(r) {
+const typeIcon = (r) => (r.type === 'risk' ? '⚠' : r.type === 'custom' ? '☑' : '▤');
+function reportRow(r, { showClient = false } = {}) {
   const s = site(r.siteId);
   const dl = reportDeadline(r);
-  const T = REPORT_TYPES[r.type];
+  const client = showClient ? contactOf(s, 'client').name : '';
   return `<a class="row" href="#/r/${r.id}/${r.status === 'sent' ? 'preview' : '0'}">
-    <span class="row-ico ${r.type}">${r.type === 'risk' ? '⚠' : '▤'}</span>
-    <span class="row-main"><b>${esc(s?.name || 'אתר ללא שם')}</b><small>${esc(T.name)} · ${formatDate(r.visitDate)}${r.number ? ` · #${esc(r.number)}` : ''}</small></span>
-    <span class="row-end">${r.status === 'sent' ? '<span class="chip ok">הופץ</span>' : dl ? `<span class="chip ${dl.kind}">${dl.label}</span>` : '<span class="chip">טיוטה</span>'}</span>
+    <span class="row-ico ${r.type}">${typeIcon(r)}</span>
+    <span class="row-main"><b>${esc(s?.name || 'אתר ללא שם')}</b><small>${esc(reportTitle(r))}${r.number ? ` #${esc(r.number)}` : ''} · ${formatDate(r.visitDate)}${client ? ` · ${esc(client)}` : ''}</small></span>
+    <span class="row-end">${r.status === 'sent' ? `<span class="chip ok">הופץ${r.sentAt ? ` ${formatDate(new Date(r.sentAt).toISOString())}` : ''}</span>` : dl ? `<span class="chip ${dl.kind}">${dl.label}</span>` : '<span class="chip">טיוטה</span>'}</span>
   </a>`;
 }
 
 // ---------------- views ----------------
 function viewHome() {
   const name = state.settings.inspector.name;
-  const pending = state.reports.filter((r) => r.status !== 'sent').sort((a, b) => b.updatedAt - a.updatedAt);
-  const sent = state.reports.filter((r) => r.status === 'sent').sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 6);
+  const reps = savedReports();
+  const pending = reps.filter((r) => r.status !== 'sent').sort((a, b) => b.updatedAt - a.updatedAt);
+  const sent = reps.filter((r) => r.status === 'sent').sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 6);
   const sites = [...state.sites].map((s) => ({ s, st: siteStats(s) }));
   const overdue = sites.filter(({ st }) => st.last && st.left <= 14);
   sites.sort((a, b) => (a.st.left ?? 1e9) - (b.st.left ?? 1e9));
+  const forms = state.settings.customForms;
 
   return `
   <section class="hero">
@@ -356,13 +404,15 @@ function viewHome() {
       <a class="action" href="#/new/visit"><span class="action-ico">▤</span><span><b>דו"ח ביקור</b><small>ביקורת שלב / רבעונית · הפצה תוך 48 ש'</small></span></a>
       <a class="action danger" href="#/new/risk"><span class="action-ico">⚠</span><span><b>סיכון בלתי קביל</b><small>הודעה מיידית לכל המכותבים</small></span></a>
     </div>
+    <div class="form-chips">${forms.map((f) => `<a class="chip-btn" href="#/new/custom/${f.id}">☑ ${esc(f.name)}</a>`).join('')}
+      <a class="chip-btn ghost" href="#/forms">${forms.length ? '⚙ טפסים מותאמים' : '+ טופס מותאם (צ\'ק ליסט משלך)'}</a></div>
   </section>
   ${!name || !state.settings.inspector.signature ? `<a class="banner" href="#/settings">⚙ השלם את פרופיל הבקר (שם, תואר וחתימה) — הם ייכנסו אוטומטית לכל דוח ←</a>` : ''}
   ${overdue.length ? `<section class="panel"><h2 class="panel-h">⏱ תזכורות ביקור <small>לפחות אחת ל-3 חודשים</small></h2>
     ${overdue.map(({ s, st }) => `<a class="row" href="#/sites/${s.id}"><span class="row-main"><b>${esc(s.name)}</b><small>ביקור אחרון ${formatDate(st.last)}</small></span><span class="row-end">${dueChip(st)}</span></a>`).join('')}
   </section>` : ''}
   <section class="panel"><h2 class="panel-h">טיוטות וממתינים להפצה <small>${pending.length}</small></h2>
-    ${pending.length ? pending.map(reportRow).join('') : '<p class="empty">אין דוחות פתוחים 🎉</p>'}
+    ${pending.length ? pending.map((r) => reportRow(r)).join('') : '<p class="empty">אין דוחות פתוחים 🎉</p>'}
   </section>
   <section class="panel"><h2 class="panel-h">אתרים <a class="link" href="#/sites">כל האתרים ←</a></h2>
     ${sites.length ? sites.slice(0, 6).map(({ s, st }) => `<a class="site-card" href="#/sites/${s.id}">
@@ -370,24 +420,28 @@ function viewHome() {
         <small class="muted">${esc(s.address || '')}</small>${stageDots(st)}</a>`).join('')
       : '<p class="empty">עוד לא נוספו אתרים. אתר נוצר אוטומטית כשפותחים דוח ראשון.</p>'}
   </section>
-  ${sent.length ? `<section class="panel"><h2 class="panel-h">הופצו לאחרונה <a class="link" href="#/reports">כל הדוחות ←</a></h2>${sent.map(reportRow).join('')}</section>` : ''}`;
+  ${sent.length ? `<section class="panel"><h2 class="panel-h">הופצו לאחרונה <a class="link" href="#/reports">כל הדוחות ←</a></h2>${sent.map((r) => reportRow(r)).join('')}</section>` : ''}`;
 }
 
-function viewNew(type) {
-  const T = REPORT_TYPES[type];
+function viewNew(type, formId) {
+  const form = type === 'custom' ? state.settings.customForms.find((f) => f.id === formId) : null;
+  if (type === 'custom' && !form) return notFound();
+  const name = form ? form.name : REPORT_TYPES[type].name;
   const sites = [...state.sites].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  const attrs = `data-type="${type}"${form ? ` data-form="${form.id}"` : ''}`;
   return `
-  <div class="page-h"><a class="back" href="#/">→</a><h1>${esc(T.name)} חדש</h1></div>
+  <div class="page-h"><a class="back" href="#/">→</a><h1>${esc(name)} — חדש</h1></div>
   <section class="panel">
     <h2 class="panel-h">באיזה אתר?</h2>
-    <form class="inline-form" data-action="new-site-report" data-type="${type}">
+    <form class="inline-form" data-action="new-site-report" ${attrs}>
       <input name="name" placeholder="שם אתר חדש…" required autocomplete="off">
       <button class="btn primary">צור ←</button>
     </form>
     ${sites.map((s) => {
       const st = siteStats(s);
-      return `<button class="row" data-action="new-report" data-type="${type}" data-site="${s.id}">
-        <span class="row-main"><b>${esc(s.name)}</b><small>${esc(s.address || '')}${st.last ? ` · ביקור אחרון ${formatDate(st.last)}` : ''}</small></span>
+      const client = contactOf(s, 'client').name;
+      return `<button class="row" data-action="new-report" ${attrs} data-site="${s.id}">
+        <span class="row-main"><b>${esc(s.name)}</b><small>${esc([s.address, client].filter(Boolean).join(' · '))}${st.last ? ` · ביקור אחרון ${formatDate(st.last)}` : ''}</small></span>
         <span class="row-end">←</span></button>`;
     }).join('')}
   </section>`;
@@ -400,18 +454,21 @@ function viewSites() {
   ${state.sites.length ? state.sites.map((s) => {
     const st = siteStats(s);
     return `<a class="site-card" href="#/sites/${s.id}"><div class="site-top"><b>${esc(s.name || 'ללא שם')}</b>${dueChip(st)}</div>
-      <small class="muted">${esc(s.address || '')} · ${st.visits.length} ביקורים · ${st.risks.length} הודעות סיכון</small>${stageDots(st)}</a>`;
+      <small class="muted">${esc([s.address, contactOf(s, 'client').name].filter(Boolean).join(' · '))} · ${st.visits.length} ביקורים · ${st.risks.length} הודעות סיכון</small>${stageDots(st)}</a>`;
   }).join('') : '<p class="empty">אין אתרים עדיין</p>'}
   </section>`;
 }
 
 function contactFields(s, role) {
-  const c = typeof s[role] === 'object' && s[role] ? s[role] : { name: s[role] || '' };
+  const c = contactOf(s, role);
   return `<fieldset class="contact"><legend>${ROLES[role]}</legend>
-    <input data-sbind="${role}.name" value="${esc(c.name)}" placeholder="שם / חברה">
     <div class="two">
+      <input data-sbind="${role}.name" value="${esc(c.name)}" placeholder="שם / חברה">
+      <input data-sbind="${role}.idNumber" value="${esc(c.idNumber || '')}" placeholder="ח.פ. / ת.ז." inputmode="numeric" dir="ltr">
+    </div>
+    <div class="two">
+      <input data-sbind="${role}.phone" value="${esc(c.phone || '')}" placeholder="נייד (וואטסאפ)" type="tel" dir="ltr" inputmode="tel">
       <input data-sbind="${role}.email" value="${esc(c.email || '')}" placeholder="אימייל" type="email" dir="ltr" inputmode="email">
-      <input data-sbind="${role}.phone" value="${esc(c.phone || '')}" placeholder="טלפון" type="tel" dir="ltr" inputmode="tel">
     </div></fieldset>`;
 }
 
@@ -422,67 +479,97 @@ function siteForm(s) {
     <div class="contacts">${Object.keys(ROLES).map((r) => contactFields(s, r)).join('')}</div>`;
 }
 
+function newReportButtons(s) {
+  return `<div class="actions compact">
+      <button class="action" data-action="new-report" data-type="visit" data-site="${s.id}"><span class="action-ico">▤</span><b>דו"ח ביקור</b></button>
+      <button class="action danger" data-action="new-report" data-type="risk" data-site="${s.id}"><span class="action-ico">⚠</span><b>סיכון בלתי קביל</b></button>
+    </div>
+    ${state.settings.customForms.length ? `<div class="form-chips">${state.settings.customForms.map((f) => `<button class="chip-btn" data-action="new-report" data-type="custom" data-form="${f.id}" data-site="${s.id}">☑ ${esc(f.name)}</button>`).join('')}</div>` : ''}`;
+}
+
 function viewSite(id) {
   const s = site(id);
   if (!s) return notFound();
   const st = siteStats(s);
-  const reps = state.reports.filter((r) => r.siteId === id).sort((a, b) => (b.visitDate || '').localeCompare(a.visitDate || ''));
+  const reps = st.reps.sort((a, b) => (b.visitDate || '').localeCompare(a.visitDate || ''));
   return `
   <div class="page-h"><a class="back" href="#/sites">→</a><h1>${esc(s.name || 'אתר')}</h1></div>
   <section class="panel">
     <div class="site-top">${stageDots(st)}${dueChip(st)}</div>
-    <div class="actions compact">
-      <button class="action" data-action="new-report" data-type="visit" data-site="${s.id}"><span class="action-ico">▤</span><b>דו"ח ביקור</b></button>
-      <button class="action danger" data-action="new-report" data-type="risk" data-site="${s.id}"><span class="action-ico">⚠</span><b>סיכון בלתי קביל</b></button>
-    </div>
+    ${newReportButtons(s)}
   </section>
   <section class="panel" data-site-id="${s.id}"><h2 class="panel-h">פרטי האתר ואנשי קשר <small class="saved" id="saved"></small></h2>${siteForm(s)}</section>
-  <section class="panel"><h2 class="panel-h">דוחות <small>${reps.length}</small></h2>${reps.length ? reps.map(reportRow).join('') : '<p class="empty">אין דוחות לאתר זה</p>'}</section>
+  <section class="panel"><h2 class="panel-h">דוחות <small>${reps.length}</small></h2>${reps.length ? reps.map((r) => reportRow(r)).join('') : '<p class="empty">אין דוחות לאתר זה</p>'}</section>
   <button class="btn ghost danger-text" data-action="delete-site" data-site="${s.id}">מחק אתר</button>`;
 }
 
+// כל הדוחות — רשימה רגילה, או מקובצים לפי מזמין העבודה מכל האתרים שלו (סעיף 5)
+function reportListHTML(q = '') {
+  const match = (r) => {
+    if (!q) return true;
+    const s = site(r.siteId);
+    return [s?.name, contactOf(s, 'client').name, reportTitle(r)].some((x) => (x || '').includes(q));
+  };
+  const reps = savedReports().filter(match).sort((a, b) => (b.visitDate || '').localeCompare(a.visitDate || ''));
+  if (!reps.length) return '<p class="empty">לא נמצאו דוחות</p>';
+  if (ui.reportsMode !== 'client') return reps.map((r) => reportRow(r, { showClient: true })).join('');
+  const groups = new Map();
+  for (const r of reps) {
+    const c = contactOf(site(r.siteId), 'client');
+    const key = (c.name || '').trim() || 'ללא מזמין';
+    if (!groups.has(key)) groups.set(key, { c, reps: [], sites: new Set() });
+    groups.get(key).reps.push(r);
+    groups.get(key).sites.add(r.siteId);
+  }
+  return [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0], 'he')).map(([name, g]) => `
+    <div class="group">
+      <div class="group-h"><b>${esc(name)}</b>${g.c.idNumber ? `<small>ח.פ./ת.ז. ${esc(g.c.idNumber)}</small>` : ''}<span class="chip">${g.sites.size} אתרים · ${g.reps.length} דוחות</span></div>
+      ${g.reps.map((r) => reportRow(r)).join('')}
+    </div>`).join('');
+}
+
 function viewReports() {
-  const reps = [...state.reports].sort((a, b) => (b.visitDate || '').localeCompare(a.visitDate || ''));
   return `
   <div class="page-h"><a class="back" href="#/">→</a><h1>כל הדוחות</h1></div>
   <section class="panel">
-    <input class="search" placeholder="חיפוש לפי אתר…" data-action="filter-reports">
-    <div id="report-list">${reps.length ? reps.map(reportRow).join('') : '<p class="empty">אין דוחות</p>'}</div>
+    <div class="tabs" role="tablist">
+      <button class="tab ${ui.reportsMode === 'all' ? 'on' : ''}" data-action="reports-mode" data-mode="all">כל הדוחות</button>
+      <button class="tab ${ui.reportsMode === 'client' ? 'on' : ''}" data-action="reports-mode" data-mode="client">לפי מזמין</button>
+    </div>
+    <input class="search" placeholder="חיפוש לפי אתר / מזמין…" data-action="filter-reports">
+    <div id="report-list">${reportListHTML()}</div>
   </section>`;
 }
 
 // ---------- report editor ----------
-const STEPS = {
-  visit: [
-    { id: 'details', name: 'פרטים' },
-    { id: 'prestart', name: 'טרום עבודה' },
-    { id: 'reason', name: 'סיבת הביקור' },
-    { id: 'risks', name: 'מענים לסיכונים' },
-    { id: 'ppe', name: 'ציוד מגן' },
-    { id: 'training', name: 'הדרכות' },
-    { id: 'sign', name: 'סיכום וחתימה' },
-    { id: 'photos', name: 'תמונות' },
-  ],
-  risk: [
-    { id: 'details', name: 'פרטים' },
-    { id: 'matrix', name: 'הערכת סיכון' },
-    { id: 'actions', name: 'מענה ופעולות' },
-    { id: 'sign', name: 'חתימה' },
-    { id: 'photos', name: 'תמונות' },
-  ],
-};
+function getSteps(r) {
+  if (r.type === 'risk') {
+    return [{ id: 'details', name: 'פרטים' }, { id: 'matrix', name: 'הערכת סיכון' }, { id: 'actions', name: 'מענה ופעולות' },
+      { id: 'sign', name: 'חתימה' }, { id: 'photos', name: 'תמונות' }];
+  }
+  if (r.type === 'visit') {
+    return [{ id: 'details', name: 'פרטים' }, { id: 'sec', keys: ['docs', 'checks'], name: 'טרום עבודה' }, { id: 'reason', name: 'סיבת הביקור' },
+      { id: 'sec', keys: ['risks'], name: 'מענים לסיכונים' }, { id: 'sec', keys: ['ppe'], name: 'ציוד מגן' },
+      { id: 'sec', keys: ['training'], name: 'הדרכות' }, { id: 'sign', name: 'סיכום וחתימה' }, { id: 'photos', name: 'תמונות' }];
+  }
+  const short = (t) => (t.length > 18 ? `${t.slice(0, 17)}…` : t);
+  return [{ id: 'details', name: 'פרטים' }, ...r.data.sections.map((s) => ({ id: 'sec', keys: [s.key], name: short(s.title || 'סעיף') })),
+    { id: 'sign', name: 'סיכום וחתימה' }, { id: 'photos', name: 'תמונות' }];
+}
+const secIndex = (r, key) => r.data.sections.findIndex((s) => s.key === key);
+const activeRows = (sec) => sec.rows.filter((x) => !x.hidden && !x.header);
 
-function stepProgress(r, stepId) {
+function stepProgress(r, step) {
   const d = r.data;
-  const tri = (rows) => rows.filter((x) => !x.other || x.label).every((x) => x.status);
-  switch (stepId) {
+  switch (step.id) {
     case 'details': return !!site(r.siteId)?.name && !!r.visitDate;
-    case 'prestart': return Object.values(d.prestartDocs).some(Boolean) || Object.values(d.prestartChecks).some(Boolean);
+    case 'sec': return step.keys.every((k) => {
+      const sec = d.sections[secIndex(r, k)];
+      const rows = sec ? activeRows(sec) : [];
+      return rows.length > 0 && rows.every((x) => x.status);
+    });
     case 'reason': return d.reasons.length > 0;
-    case 'risks': return tri(d.risks);
-    case 'ppe': return tri(d.ppe);
-    case 'training': return tri(d.training);
-    case 'matrix': return !!(d.severity && d.likelihood && d.riskText.trim());
+    case 'matrix': return !!((d.severity && d.likelihood) || d.levelOverride) && !!d.riskText.trim();
     case 'actions': return !!(d.requiredResponse.trim() || d.correctiveActions.trim());
     case 'sign': return !!(r.inspector?.name && r.inspector?.signature);
     case 'photos': return (r.photos || []).length > 0;
@@ -490,41 +577,86 @@ function stepProgress(r, stepId) {
   return false;
 }
 
-function triSection(r, key, textKey, textLabel, head) {
-  const rows = r.data[key];
+function photoActions(ref, caption, small = true) {
+  const cls = small ? 'link-btn' : 'btn small';
+  return `<button class="${cls}" data-action="add-photo" data-capture="1" data-ref="${esc(ref)}" data-caption="${esc(caption)}">📷 צלם</button>
+    <button class="${cls}" data-action="add-photo" data-ref="${esc(ref)}" data-caption="${esc(caption)}">🖼 מהגלריה</button>`;
+}
+function thumbs(r, ref) {
+  const pics = r.photos.filter((p) => p.ref === ref);
+  if (!pics.length) return '';
+  return `<div class="thumbs">${pics.map((p) => `<span class="thumb"><img src="${p.src}" alt=""><button data-action="del-photo" data-id="${p.id}" aria-label="מחק תמונה">✕</button></span>`).join('')}</div>`;
+}
+
+function triRow(r, si, j, x, sec) {
+  const p = `data.sections.${si}.rows.${j}`;
+  const ref = `${sec.key}:${x.id}`;
+  const open = x.status === 'bad' || (x.note || '').trim() || ui.openNotes.has(x.id);
+  return `<div class="tri-row ${x.status ? `is-${x.status}` : ''} lvl${x.level || 0}" role="listitem">
+    <div class="tri-label">${esc(x.label)}</div>
+    <div class="seg" role="radiogroup">${['ok', 'bad', 'na'].map((k) => `<button class="seg-${k} ${x.status === k ? 'on' : ''}" data-action="tri" data-path="${p}" data-val="${k}" role="radio" aria-checked="${x.status === k}">${STATUS_ICONS[k]}<span>${esc(sec.labels[k])}</span></button>`).join('')}</div>
+    <div class="tri-extra">
+      ${open ? `<textarea data-bind="${p}.note" rows="2" placeholder="${x.status === 'bad' ? 'פירוט הליקוי / מה חסר…' : 'הערה — למשל מה לא מושלם…'}">${esc(x.note)}</textarea>` : ''}
+      ${thumbs(r, ref)}
+      <div class="tri-note-actions">
+        ${!open ? `<button class="link-btn" data-action="open-note" data-id="${x.id}" data-path="${p}">💬 הערה</button>` : ''}
+        ${photoActions(ref, x.label)}
+        ${r.type === 'visit' && x.status === 'bad' ? `<button class="link-btn danger" data-action="escalate" data-path="${p}">⚠ הודעת סיכון בלתי קביל</button>` : ''}
+      </div>
+    </div>
+  </div>`;
+}
+
+function editRow(si, j, x) {
+  const p = `data.sections.${si}.rows.${j}`;
+  return `<div class="edit-row ${x.hidden ? 'is-hidden' : ''} ${x.header ? 'is-header' : ''} lvl${x.level || 0}">
+    <input data-bind="${p}.label" value="${esc(x.label)}" ${x.hidden ? 'disabled' : ''} placeholder="${x.header ? 'כותרת קבוצה' : 'נוסח השורה'}">
+    ${x.hidden
+      ? `<button class="btn small" data-action="row-restore" data-path="${p}">↺ החזר</button>`
+      : `<button class="icon-btn2" data-action="row-hide" data-path="${p}" data-si="${si}" data-j="${j}" title="הסר מהדוח" aria-label="הסר שורה">✕</button>`}
+  </div>`;
+}
+
+function sectionEditor(r, si, { showTitle }) {
+  const sec = r.data.sections[si];
+  const editing = ui.editList === `${r.id}:${sec.key}`;
+  const rows = activeRows(sec);
   const count = (k) => rows.filter((x) => x.status === k).length;
-  return `
-  <div class="tri-tools">
-    <span class="tri-count"><span class="ok">✓ ${count('ok')}</span><span class="bad">✗ ${count('bad')}</span><span class="na">— ${count('na')}</span></span>
-    <button class="btn small" data-action="tri-fill" data-key="${key}">סמן את הנותרים כ"תקין"</button>
-  </div>
-  <div class="tri-list" role="list" aria-label="${esc(head)}">
-  ${rows.map((x, i) => {
-    const p = `data.${key}.${i}`;
-    return `<div class="tri-row ${x.status ? `is-${x.status}` : ''}" role="listitem">
-      <div class="tri-label">${x.other ? `<input data-bind="${p}.label" value="${esc(x.label)}" placeholder="אחר — נושא נוסף…">` : esc(x.label)}</div>
-      <div class="seg" role="radiogroup">${['ok', 'bad', 'na'].map((k) => `<button class="seg-${k} ${x.status === k ? 'on' : ''}" data-action="tri" data-path="${p}" data-val="${k}" role="radio" aria-checked="${x.status === k}">${STATUS[k].icon}<span>${STATUS[k].label}</span></button>`).join('')}</div>
-      ${x.status === 'bad' ? `<div class="tri-note">
-        <textarea data-bind="${p}.note" rows="2" placeholder="פירוט הליקוי / המענה שאינו מיושם…">${esc(x.note)}</textarea>
-        <div class="tri-note-actions">
-          <button class="btn small" data-action="add-photo" data-caption="${esc(x.label || 'אחר')}">📷 צרף תמונה</button>
-          ${r.type === 'visit' ? `<button class="btn small danger" data-action="escalate" data-path="${p}">⚠ פתח הודעת סיכון בלתי קביל</button>` : ''}
-        </div></div>` : ''}
-    </div>`;
-  }).join('')}
-  </div>
-  <label class="field"><span>${esc(textLabel)} <small class="muted">(הערות שנכתבו לליקויים למעלה נכנסות אוטומטית)</small></span>
-    <textarea data-bind="data.${textKey}" rows="3" placeholder="פירוט נוסף…">${esc(r.data[textKey])}</textarea></label>`;
+  const hiddenN = sec.rows.filter((x) => x.hidden).length;
+  return `<div class="sec">
+    ${showTitle ? `<h3 class="step-sub">${esc(sec.title)}</h3>` : ''}
+    <div class="tri-tools">
+      <span class="tri-count"><span class="ok">✓ ${count('ok')}</span><span class="bad">✗ ${count('bad')}</span><span class="na">— ${count('na')}</span></span>
+      <span class="row-btns tight">
+        ${!editing ? `<button class="btn small" data-action="tri-fill" data-si="${si}">סמן נותרים "${esc(sec.labels.ok)}"</button>` : ''}
+        <button class="btn small ${editing ? 'primary' : ''}" data-action="edit-list" data-key="${sec.key}">${editing ? '✓ סיום עריכה' : `✎ ערוך רשימה${hiddenN ? ` (${hiddenN} הוסרו)` : ''}`}</button>
+      </span>
+    </div>
+    ${editing ? `<p class="muted tiny">שנה נוסח, הסר שורות שלא רלוונטיות או הוסף שורות. השינוי חל על הדוח הזה בלבד. את רשימת ברירת המחדל לדוחות הבאים קובעים ב<a class="link" href="#/settings">הגדרות</a>.</p>` : ''}
+    <div class="tri-list" role="list">
+      ${sec.rows.map((x, j) => (editing ? editRow(si, j, x) : x.hidden ? '' : x.header ? `<div class="tri-group">${esc(x.label)}</div>` : triRow(r, si, j, x, sec))).join('')}
+    </div>
+    ${editing ? `<div class="row-btns"><button class="btn small" data-action="add-row" data-si="${si}">+ הוסף שורה</button><button class="btn small" data-action="add-row" data-si="${si}" data-header="1">+ הוסף כותרת</button></div>` : ''}
+    <label class="field"><span>${esc(sec.textLabel)} <small class="muted">(הערות שנכתבו בשורות נכנסות אוטומטית)</small></span>
+      <textarea data-bind="data.sections.${si}.text" rows="3" placeholder="פירוט נוסף…">${esc(sec.text)}</textarea></label>
+    <div class="row-btns">${photoActions(sec.key, sec.title, false)}</div>
+    ${thumbs(r, sec.key)}
+  </div>`;
 }
 
 function signStep(r) {
   const ins = r.inspector || {};
-  const summary = r.data.summary ?? state.settings.defaultSummary;
-  return `
-  ${r.type === 'visit' ? `
-    <div class="decl"><b>הצהרה</b><p>${esc(DECLARATION)}</p></div>
-    <label class="field"><span>סיכום מקצועי <small class="muted">(ברירת המחדל נקבעת בהגדרות)</small></span>
-      <textarea data-bind="data.summary" rows="6">${esc(summary)}</textarea></label>` : ''}
+  const d = r.data;
+  let top = '';
+  if (r.type === 'visit') {
+    const summary = d.summary ?? state.settings.defaultSummary;
+    top = `<div class="decl"><b>הצהרה</b><p>${esc(DECLARATION)}</p></div>
+      <label class="field"><span>סיכום מקצועי <small class="muted">(ברירת המחדל נקבעת בהגדרות)</small></span>
+      <textarea data-bind="data.summary" rows="6">${esc(summary)}</textarea></label>`;
+  } else if (r.type === 'custom') {
+    top = `<label class="field"><span>${esc(d.summaryLabel)}</span><textarea data-bind="data.summary" rows="5">${esc(d.summary)}</textarea></label>`;
+  }
+  return `${top}
   <div class="grid2">
     <label class="field"><span>שם מלא</span><input data-bind="inspector.name" value="${esc(ins.name || '')}"></label>
     <label class="field"><span>תואר</span><select data-bind="inspector.title">${SIGNER_TITLES.map((t) => `<option ${t === ins.title ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select></label>
@@ -538,10 +670,20 @@ function signStep(r) {
   </div>`;
 }
 
+function photoPlace(r, ref) {
+  if (!ref) return 'נספח';
+  if (ref === 'risk') return 'פירוט הסיכון';
+  const [key, rowId] = ref.split(':');
+  const sec = r.data.sections?.find((s) => s.key === key);
+  if (!sec) return 'נספח';
+  const row = rowId && sec.rows.find((x) => x.id === rowId);
+  return row ? `${sec.title} › ${row.label}` : sec.title;
+}
+
 function photosStep(r) {
   const photos = r.photos || [];
   return `
-  <p class="muted">תמונות, טפסים, תסקירים וכיו"ב לתיעוד — יופיעו כנספח בסוף הדוח.</p>
+  <p class="muted">תמונה שמצלמים מתוך שורה או סעיף בטופס נכנסת לדוח ליד אותו סעיף. כאן אפשר להוסיף תמונות כלליות, שיופיעו כנספח בסוף הדוח.</p>
   <div class="row-btns">
     <button class="btn primary" data-action="add-photo" data-capture="1">📷 צלם</button>
     <button class="btn" data-action="add-photo">🖼 בחר מהגלריה</button>
@@ -549,39 +691,42 @@ function photosStep(r) {
   <div class="photo-grid">
   ${photos.map((p, i) => `<figure class="photo">
       <img src="${p.src}" alt="">
+      <small class="photo-place">📍 ${esc(photoPlace(r, p.ref))}${p.ref ? ` · <button class="link-btn" data-action="photo-to-appendix" data-id="${p.id}">העבר לנספח</button>` : ''}</small>
       <input data-bind="photos.${i}.caption" value="${esc(p.caption || '')}" placeholder="כיתוב לתמונה…">
-      <button class="icon-btn" data-action="del-photo" data-i="${i}" aria-label="מחק תמונה">✕</button>
+      <button class="icon-btn" data-action="del-photo" data-id="${p.id}" aria-label="מחק תמונה">✕</button>
     </figure>`).join('')}
   </div>`;
 }
 
-function stepBody(r, stepId) {
+function stepBody(r, step) {
   const s = site(r.siteId) || {};
   const d = r.data;
-  const T = REPORT_TYPES[r.type];
-  switch (stepId) {
+  switch (step.id) {
     case 'details': {
       const st = siteStats(s);
+      const T = REPORT_TYPES[r.type];
+      const from = d.fromReport && report(d.fromReport);
+      const linked = savedReports().filter((x) => x.data?.fromReport === r.id);
       return `
       <div class="grid3">
         <label class="field"><span>תאריך הביקור</span><input type="date" data-bind="visitDate" value="${r.visitDate || ''}"></label>
         <label class="field"><span>תאריך הדו"ח</span><input type="date" data-bind="reportDate" value="${r.reportDate || ''}"></label>
-        <label class="field"><span>מס' דו"ח <small class="muted">(רשות)</small></span><input data-bind="number" value="${esc(r.number || '')}" inputmode="numeric"></label>
+        <label class="field"><span>מס' דו"ח <small class="muted">(מספור אוטומטי לאתר)</small></span><input data-bind="number" value="${esc(r.number || '')}" inputmode="numeric"></label>
       </div>
-      <div class="callout ${r.type === 'risk' ? 'danger' : ''}">
+      ${r.type !== 'custom' ? `<div class="callout ${r.type === 'risk' ? 'danger' : ''}">
         <b>${esc(T.distribution)}</b><br>
         <small>מכותבים: ${T.recipients.map((x) => ROLES[x]).join(' · ')}</small>
-        ${st.last && r.type === 'visit' ? `<br><small>ביקור קודם באתר: ${formatDate(st.last)}</small>` : ''}
-      </div>
+        ${st.last && r.type === 'visit' ? `<br><small>ביקור קודם באתר: ${formatDate(st.last)} · ביקור הבא נדרש עד ${formatDate(st.due)}</small>` : ''}
+        ${from ? `<br><small>נפתח מתוך <a class="link" href="#/r/${from.id}/0">${esc(reportTitle(from))} מ-${formatDate(from.visitDate)}</a></small>` : ''}
+        ${linked.length ? `<br><small>הודעות סיכון שנפתחו מדוח זה: ${linked.map((x) => `<a class="link" href="#/r/${x.id}/0">${formatDate(x.visitDate)}</a>`).join(', ')}</small>` : ''}
+      </div>` : ''}
+      <label class="field"><span>אופן ההפצה <small class="muted">(מופיע בנתונים הכלליים בדוח)</small></span><input data-bind="data.distMethod" value="${esc(d.distMethod || '')}" placeholder='וואטסאפ / דוא"ל'></label>
       <h3 class="step-sub">נתונים כלליים <small class="muted">— נשמרים באתר ומתמלאים אוטומטית בדוחות הבאים</small></h3>
       <div data-site-id="${s.id}">${siteForm(s)}</div>`;
     }
-    case 'prestart':
-      return `
-      <h3 class="step-sub">מסמכים חובה <button class="btn small" data-action="check-all" data-group="prestartDocs">סמן הכל</button></h3>
-      <div class="checks">${PRESTART_DOCS.map((i) => `<label class="check lvl${i.level || 0}"><input type="checkbox" data-bind="data.prestartDocs.${i.id}" ${d.prestartDocs[i.id] ? 'checked' : ''}><span>${esc(i.label)}</span></label>`).join('')}</div>
-      <h3 class="step-sub">בדיקות הבקר: בקרה, ביקורת, התרעה <button class="btn small" data-action="check-all" data-group="prestartChecks">סמן הכל</button></h3>
-      <div class="checks">${PRESTART_CHECKS.map((i) => `<label class="check"><input type="checkbox" data-bind="data.prestartChecks.${i.id}" ${d.prestartChecks[i.id] ? 'checked' : ''}><span>${esc(i.label)}</span></label>`).join('')}</div>`;
+    case 'sec':
+      return step.keys.map((k) => secIndex(r, k)).filter((i) => i >= 0)
+        .map((i) => sectionEditor(r, i, { showTitle: step.keys.length > 1 || r.type === 'custom' })).join('');
     case 'reason': {
       const st = siteStats(s);
       const prev = new Set(st.visits.filter((v) => v.id !== r.id).flatMap((v) => v.data.reasons));
@@ -590,22 +735,23 @@ function stepBody(r, stepId) {
       <div class="chips-select">${VISIT_REASONS.map((x) => `<button class="pick ${d.reasons.includes(x.id) ? 'on' : ''}" data-action="toggle-reason" data-id="${x.id}" aria-pressed="${d.reasons.includes(x.id)}">
         <span class="pick-box">${d.reasons.includes(x.id) ? '✓' : ''}</span><span>${esc(x.label)}${prev.has(x.id) ? '<small>בוצע בעבר באתר זה</small>' : ''}</span></button>`).join('')}</div>`;
     }
-    case 'risks':
-      return triSection(r, 'risks', 'risksText', 'פירוט הליקויים או מענים שאינם מיושמים', 'הנושא');
-    case 'ppe':
-      return `<p class="muted">יש לוודא התאמה ותקינות הציוד לסוג העבודה המבוצעת.</p>${triSection(r, 'ppe', 'ppeText', 'פירוט הליקויים', 'הפריט')}`;
-    case 'training':
-      return triSection(r, 'training', 'trainingText', 'פירוט הליקויים ואיזה הדרכות חסרות?', 'הפריט');
     case 'matrix': {
-      const res = riskLevel(d.severity, d.likelihood);
+      const res = finalRisk(d);
       return `
-      <p class="muted">הקש על התא המתאים בלוח ההחלטה (חומרת פגיעה × הסתברות).</p>
-      <div class="mx-wrap">${matrixTable({ sev: d.severity, lik: d.likelihood }, { interactive: true })}</div>
-      ${res ? `<div class="mx-result mx-${res.level}"><b>${res.score}</b><span>${esc(LEVEL_INFO[res.level].label)}</span>
-        <small>חומרה: ${esc(SEVERITY.find((x) => x.v === d.severity).name)} · הסתברות: ${esc(LIKELIHOOD.find((x) => x.v === d.likelihood).name)}</small></div>
-        ${res.level !== 'red' ? '<p class="warn-text">⚠ הסיכון שנבחר אינו מוגדר "בלתי קביל" בלוח. ניתן עדיין להפיץ את הטופס כ"ממצא אחר".</p>' : ''}` : ''}
+      <label class="check"><input type="checkbox" data-bind="data.showMatrix" data-rerender="1" ${d.showMatrix !== false ? 'checked' : ''}><span>הצג את לוח ההחלטה בדוח</span></label>
+      ${d.showMatrix !== false ? `<p class="muted">הקש על התא המתאים בלוח ההחלטה (חומרת פגיעה × הסתברות).</p>
+      <div class="mx-wrap">${matrixTable({ sev: d.severity, lik: d.likelihood }, { interactive: true })}</div>` : ''}
+      <label class="field"><span>דירוג הסיכון בדוח</span>
+        <select data-bind="data.levelOverride" data-rerender="1">
+          <option value="" ${!d.levelOverride ? 'selected' : ''}>לפי לוח ההחלטה (אוטומטי)</option>
+          ${Object.entries(LEVEL_INFO).map(([k, v]) => `<option value="${k}" ${d.levelOverride === k ? 'selected' : ''}>ידני: ${esc(v.label)}</option>`).join('')}
+        </select></label>
+      ${res ? `<div class="mx-result mx-${res.level}"><b>${res.score && !res.manual ? res.score : '✎'}</b><span>${esc(LEVEL_INFO[res.level].label)}</span>
+        <small>${res.manual ? 'דירוג ידני' : `חומרה: ${esc(SEVERITY.find((x) => x.v === d.severity).name)} · הסתברות: ${esc(LIKELIHOOD.find((x) => x.v === d.likelihood).name)}`}</small></div>
+        ${res.level !== 'red' ? '<p class="warn-text">⚠ הדירוג שנבחר אינו "בלתי קביל". אפשר עדיין להפיץ את הטופס כ"ממצא אחר".</p>' : ''}` : ''}
       <label class="field"><span>פירוט הסיכון הבלתי קביל שנמצא</span><textarea data-bind="data.riskText" rows="5" placeholder="מה נמצא, היכן באתר, מי חשוף…">${esc(d.riskText)}</textarea></label>
-      <button class="btn small" data-action="add-photo" data-caption="הסיכון שנמצא">📷 צרף תמונה של הסיכון</button>`;
+      <div class="row-btns">${photoActions('risk', 'הסיכון שנמצא', false)}</div>
+      ${thumbs(r, 'risk')}`;
     }
     case 'actions':
       return `
@@ -624,24 +770,25 @@ function viewReport(id, stepArg) {
   const r = report(id);
   if (!r) return notFound();
   if (stepArg === 'preview') return viewPreview(r);
-  const steps = STEPS[r.type];
+  const steps = getSteps(r);
   const idx = Math.min(Math.max(parseInt(stepArg, 10) || 0, 0), steps.length - 1);
   const step = steps[idx];
   const s = site(r.siteId);
+  const status = r._draft ? 'חדש — יישמר עם השינוי הראשון' : r.status === 'sent' ? 'הופץ' : 'טיוטה';
   return `
   <div class="page-h"><a class="back" href="#/">→</a>
-    <h1><span class="type-tag ${r.type}">${r.type === 'risk' ? '⚠' : '▤'} ${esc(REPORT_TYPES[r.type].name)}</span> ${esc(s?.name || '')}</h1>
-    <small class="saved" id="saved">${r.status === 'sent' ? 'הופץ' : 'טיוטה'}</small>
+    <h1><span class="type-tag ${r.type}">${typeIcon(r)} ${esc(reportTitle(r))}${r.number ? ` #${esc(r.number)}` : ''}</span> ${esc(s?.name || '')}</h1>
+    <small class="saved" id="saved">${status}</small>
   </div>
   <div class="editor">
     <nav class="steps" aria-label="שלבי הטופס">
-      ${steps.map((x, i) => `<a href="#/r/${r.id}/${i}" class="step ${i === idx ? 'on' : ''} ${stepProgress(r, x.id) ? 'done' : ''}" ${i === idx ? 'aria-current="step"' : ''}>
-        <span class="step-n">${stepProgress(r, x.id) ? '✓' : i + 1}</span><span>${esc(x.name)}</span></a>`).join('')}
+      ${steps.map((x, i) => `<a href="#/r/${r.id}/${i}" class="step ${i === idx ? 'on' : ''} ${stepProgress(r, x) ? 'done' : ''}" ${i === idx ? 'aria-current="step"' : ''}>
+        <span class="step-n">${stepProgress(r, x) ? '✓' : i + 1}</span><span>${esc(x.name)}</span></a>`).join('')}
       <a href="#/r/${r.id}/preview" class="step preview"><span class="step-n">⎙</span><span>תצוגה והפקה</span></a>
     </nav>
     <section class="step-panel" data-report-id="${r.id}">
       <h2 class="step-h"><span class="mono muted">${idx + 1}/${steps.length}</span> ${esc(step.name)}</h2>
-      ${stepBody(r, step.id)}
+      ${stepBody(r, step)}
       <div class="step-nav">
         ${idx > 0 ? `<a class="btn" href="#/r/${r.id}/${idx - 1}">→ הקודם</a>` : '<span></span>'}
         ${idx < steps.length - 1 ? `<a class="btn primary" href="#/r/${r.id}/${idx + 1}">הבא ←</a>` : `<a class="btn primary" href="#/r/${r.id}/preview">לתצוגה והפקה ←</a>`}
@@ -657,63 +804,139 @@ function validate(r) {
   if (!r.visitDate) issues.push('חסר תאריך ביקור');
   if (!r.inspector?.name) issues.push('חסר שם הבקר');
   if (!r.inspector?.signature) issues.push('חסרה חתימה');
-  if (r.type === 'visit') {
-    const d = r.data;
-    if (!d.reasons.length) issues.push('לא סומנה סיבת ביקור');
-    for (const [k, name] of [['risks', 'מענים לסיכונים'], ['ppe', 'ציוד מגן'], ['training', 'הדרכות']]) {
-      const open = d[k].filter((x) => (!x.other || x.label) && !x.status).length;
-      if (open) issues.push(`${name}: ${open} פריטים לא סומנו`);
-      const noNote = d[k].filter((x) => x.status === 'bad' && !x.note.trim()).length;
-      if (noNote && !d[`${k}Text`].trim()) issues.push(`${name}: ליקוי ללא פירוט`);
-    }
-  } else {
-    const d = r.data;
-    if (!d.severity || !d.likelihood) issues.push('לא נבחרה הערכת סיכון בלוח ההחלטה');
+  const d = r.data;
+  if (r.type === 'risk') {
+    if (!(d.severity && d.likelihood) && !d.levelOverride) issues.push('לא נבחר דירוג סיכון');
     if (!d.riskText.trim()) issues.push('חסר פירוט הסיכון');
     if (!d.requiredResponse.trim()) issues.push('חסר המענה הנדרש');
+    return issues;
+  }
+  if (r.type === 'visit' && !d.reasons.length) issues.push('לא סומנה סיבת ביקור');
+  for (const sec of d.sections) {
+    if (['docs', 'checks'].includes(sec.key)) continue;
+    const rows = activeRows(sec);
+    const open = rows.filter((x) => !x.status).length;
+    if (open) issues.push(`${sec.title.slice(0, 30)}: ${open} פריטים לא סומנו`);
+    if (rows.some((x) => x.status === 'bad' && !(x.note || '').trim()) && !sec.text.trim()) issues.push(`${sec.title.slice(0, 30)}: ליקוי ללא פירוט`);
   }
   return issues;
 }
 
-function recipientsInfo(r) {
+// ---------- תפוצה (סעיף 1) ----------
+const recipKey = (x) => (x.email || '').toLowerCase() || waNumber(x.phone) || (x.name || '').trim();
+function defaultRecipients(r) {
   const s = site(r.siteId) || {};
-  return REPORT_TYPES[r.type].recipients.map((role) => {
-    const c = typeof s[role] === 'object' && s[role] ? s[role] : { name: s[role] || '' };
-    return { role, label: ROLES[role], ...c };
-  });
+  const list = [];
+  for (const role of REPORT_TYPES[r.type].recipients) {
+    const c = contactOf(s, role);
+    if (c.name || c.phone || c.email) list.push({ id: uid(), name: c.name || '', role: ROLES[role], phone: c.phone || '', email: c.email || '', on: true, src: 'site' });
+  }
+  const dist = state.settings.distribution;
+  if (dist.includeSelf !== false) {
+    const ins = state.settings.inspector;
+    list.push({ id: uid(), name: ins.name || 'אני', role: 'עורך הדו"ח', phone: ins.phone || '', email: ins.email || state.user?.email || '', on: true, src: 'self' });
+  }
+  const extras = dist[r.type]?.length ? dist[r.type] : state.settings.lastRecipients[r.type] || [];
+  for (const e of extras) {
+    if (!list.some((x) => recipKey(x) && recipKey(x) === recipKey(e))) list.push({ name: '', role: '', phone: '', email: '', ...e, id: uid(), on: true, src: 'extra' });
+  }
+  return list;
+}
+const recipients = (r) => (r.recipients?.length ? r.recipients : defaultRecipients(r));
+const ownRecipients = (r) => {
+  if (!r.recipients?.length) r.recipients = defaultRecipients(r);
+  return r.recipients;
+};
+function shareMessage(r, name) {
+  const s = site(r.siteId) || {};
+  return `שלום${name ? ` ${name}` : ''},\nמצורף ${reportTitle(r)}${r.number ? ` מס' ${r.number}` : ''} – ${s.name || ''} מתאריך ${formatDate(r.visitDate)}.\n\n${state.settings.inspector.name || ''}${state.settings.company.name ? `\n${state.settings.company.name}` : ''}`;
+}
+async function rememberRecipients(r) {
+  const extras = ownRecipients(r).filter((x) => x.src === 'extra' || x.src === 'added').map(({ name, role, phone, email }) => ({ name, role, phone, email }));
+  state.settings.lastRecipients[r.type] = extras;
+  await saveSettings();
+  if (r.status !== 'sent') ui.askSent = r.id;
 }
 
 function viewPreview(r) {
   const s = site(r.siteId);
   const model = buildModel(r, s, state.settings);
   const issues = validate(r);
-  const recips = recipientsInfo(r);
-  const emails = recips.map((x) => x.email).filter(Boolean);
+  const recips = recipients(r);
   const dl = reportDeadline(r);
+  const linked = savedReports().filter((x) => x.data?.fromReport === r.id);
+  const on = recips.filter((x) => x.on);
   return `
-  <div class="page-h"><a class="back" href="#/r/${r.id}/0">→</a><h1>תצוגה והפקה</h1>${dl ? `<span class="chip ${dl.kind}">${dl.label}</span>` : r.status === 'sent' ? '<span class="chip ok">הופץ</span>' : ''}</div>
+  <div class="page-h"><a class="back" href="#/r/${r.id}/0">→</a><h1>תצוגה והפקה</h1>
+    ${dl ? `<span class="chip ${dl.kind}">${dl.label}</span>` : r.status === 'sent' ? '<span class="chip ok">הופץ</span>' : ''}
+    <a class="btn small" href="#/r/${r.id}/0">✎ עריכת הדוח</a></div>
   <div class="preview-layout">
     <aside class="preview-side">
       <div class="panel">
         <div class="export-btns">
           <button class="btn primary" data-action="export-pdf">⬇ PDF</button>
           <button class="btn primary" data-action="export-docx">⬇ Word</button>
-          <button class="btn" data-action="share">↗ שיתוף</button>
+          <button class="btn" data-action="share">↗ שיתוף קובץ</button>
           <button class="btn" data-action="print">⎙ הדפסה</button>
         </div>
       </div>
       ${issues.length ? `<div class="panel issues"><h2 class="panel-h">לפני הפצה <small>${issues.length}</small></h2><ul>${issues.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '<div class="panel ok-panel">✓ הדוח מלא ומוכן להפצה</div>'}
-      <div class="panel">
-        <h2 class="panel-h">מכותבים</h2>
-        ${recips.map((x) => `<div class="recip"><b>${esc(x.label)}</b><span>${esc(x.name || '—')}</span>${x.email ? `<small dir="ltr">${esc(x.email)}</small>` : ''}</div>`).join('')}
-        ${emails.length ? `<a class="btn small" href="mailto:${emails.map(encodeURIComponent).join(',')}?subject=${encodeURIComponent(model.filename)}">✉ פתח מייל למכותבים</a>` : '<small class="muted">הוסף כתובות מייל בפרטי האתר כדי לשלוח בלחיצה</small>'}
-        <p class="muted tiny">טיפ: בטלפון, "שיתוף" שולח את ה-PDF ישירות לוואטסאפ/מייל.</p>
+      <div class="panel dist">
+        <h2 class="panel-h">תפוצה <small>${on.length} נבחרו</small>${r.recipients?.length ? '<button class="link-btn" data-action="recip-reset" title="חזרה לרשימת ברירת המחדל">↺ ברירת מחדל</button>' : ''}</h2>
+        ${recips.map((x, i) => `<div class="recip2 ${x.on ? '' : 'off'}">
+          <label class="recip-check"><input type="checkbox" data-action="recip-toggle" data-i="${i}" ${x.on ? 'checked' : ''}>
+            <span><b>${esc(x.name || '—')}</b><small>${esc(x.role || '')}</small></span></label>
+          <span class="recip-btns">
+            ${x.phone ? `<button class="mini wa" data-action="send-wa" data-i="${i}" title="וואטסאפ ${esc(x.phone)}">וואטסאפ</button>` : ''}
+            ${x.email ? `<button class="mini gm" data-action="send-gmail" data-i="${i}" title="${esc(x.email)}">Gmail</button>` : ''}
+            ${x.src !== 'site' ? `<button class="mini x" data-action="recip-remove" data-i="${i}" aria-label="הסר">✕</button>` : ''}
+          </span>
+          ${x.phone || x.email ? `<small class="recip-reach" dir="ltr">${esc([x.phone, x.email].filter(Boolean).join(' · '))}</small>` : '<small class="recip-reach muted">אין טלפון/מייל — הוסף בפרטי האתר</small>'}
+        </div>`).join('')}
+        ${ui.addRecipient ? `<form class="add-recip" data-action="recip-add">
+          <input name="name" placeholder="שם" required><input name="role" placeholder="תפקיד (רשות)">
+          <input name="phone" placeholder="נייד" type="tel" dir="ltr"><input name="email" placeholder="אימייל" type="email" dir="ltr">
+          <div class="row-btns"><button class="btn small primary">הוסף</button><button class="btn small ghost" type="button" data-action="recip-add-toggle">ביטול</button></div>
+        </form>` : '<button class="link-btn" data-action="recip-add-toggle">+ הוסף נמען</button>'}
+        <div class="row-btns">
+          <button class="btn small" data-action="send-gmail-all" ${on.some((x) => x.email) ? '' : 'disabled'}>Gmail לכל הנבחרים</button>
+          <button class="btn small" data-action="send-mail-all" ${on.some((x) => x.email) ? '' : 'disabled'}>✉ אפליקציית מייל</button>
+        </div>
+        <p class="muted tiny">${isMobile() ? 'בטלפון: לחיצה על "וואטסאפ" פותחת את חלון השיתוף עם קובץ ה-PDF — בחר וואטסאפ ואת איש הקשר.' : 'במחשב: ה-PDF יורד אוטומטית ונפתחת הודעה מוכנה — גרור את הקובץ להודעה.'} נמענים קבועים נקבעים ב<a class="link" href="#/settings">הגדרות</a>; אם לא הוגדרו, נזכרים הנמענים האחרונים.</p>
+        ${ui.askSent === r.id && r.status !== 'sent' ? '<div class="ask-sent">שלחת את הדוח? סמן אותו כהופץ כדי להוריד אותו מרשימת הממתינים.</div>' : ''}
         <button class="btn ${r.status === 'sent' ? '' : 'primary'} full" data-action="mark-sent">${r.status === 'sent' ? '↺ החזר לטיוטה' : '✓ סמן כהופץ'}</button>
+        <p class="muted tiny">"הופץ" רק מסמן שהדוח נשלח: הוא יוצא מרשימת "ממתינים להפצה" ומתזכורות המועד, ונשמר תאריך ההפצה. אפשר להמשיך לערוך גם אחרי זה.</p>
       </div>
+      ${linked.length ? `<div class="panel"><h2 class="panel-h">הודעות סיכון שנפתחו מדוח זה</h2>${linked.map((x) => reportRow(x)).join('')}</div>` : ''}
       <button class="btn ghost danger-text" data-action="delete-report">מחק דוח</button>
     </aside>
     <div class="paper-scroller"><div class="paper-scale" id="paper-scale">${renderPaper(model)}</div></div>
   </div>`;
+}
+
+// ---------- settings ----------
+function peopleEditor(type, label) {
+  const list = state.settings.distribution[type];
+  return `<div class="people">
+    <h3 class="step-sub">${esc(label)} <button class="btn small" data-action="dist-add" data-type="${type}">+ הוסף</button></h3>
+    ${list.length ? list.map((p, i) => `<div class="person">
+      <input data-setbind="distribution.${type}.${i}.name" value="${esc(p.name || '')}" placeholder="שם">
+      <input data-setbind="distribution.${type}.${i}.role" value="${esc(p.role || '')}" placeholder="תפקיד">
+      <input data-setbind="distribution.${type}.${i}.phone" value="${esc(p.phone || '')}" placeholder="נייד" type="tel" dir="ltr">
+      <input data-setbind="distribution.${type}.${i}.email" value="${esc(p.email || '')}" placeholder="אימייל" type="email" dir="ltr">
+      <button class="icon-btn2" data-action="dist-remove" data-type="${type}" data-i="${i}" aria-label="הסר">✕</button>
+    </div>`).join('') : `<p class="muted tiny">לא הוגדרו — ${state.settings.lastRecipients[type]?.length ? `ישמשו הנמענים האחרונים (${state.settings.lastRecipients[type].map((x) => esc(x.name)).join(', ')})` : 'יישמרו הנמענים האחרונים שתשלח אליהם'}.</p>`}
+  </div>`;
+}
+
+function templatesEditor() {
+  const t = state.settings.templates;
+  return VISIT_SECTION_DEFS.map((def) => `
+    <details class="tpl" ${t[def.key] ? 'open' : ''}>
+      <summary>${esc(def.title.length > 60 ? `${def.title.slice(0, 58)}…` : def.title)} ${t[def.key] ? '<span class="chip warn">מותאם</span>' : ''}</summary>
+      <textarea data-template="${def.key}" rows="${Math.min(14, def.items.length + 2)}">${esc(t[def.key] ?? defaultItemsText(def.key))}</textarea>
+      ${t[def.key] ? `<button class="btn small" data-action="template-reset" data-key="${def.key}">↺ שחזר נוסח מקורי</button>` : ''}
+    </details>`).join('');
 }
 
 function viewSettings() {
@@ -721,12 +944,12 @@ function viewSettings() {
   const ins = st.inspector;
   return `
   <div class="page-h"><a class="back" href="#/">→</a><h1>הגדרות</h1><small class="saved" id="saved"></small></div>
-  <section class="panel" data-settings>
+  <section class="panel">
     <h2 class="panel-h">פרופיל הבקר <small>ייכנס אוטומטית לכל דוח חדש</small></h2>
     <div class="grid2">
       <label class="field"><span>שם מלא</span><input data-setbind="inspector.name" value="${esc(ins.name)}"></label>
       <label class="field"><span>תואר</span><select data-setbind="inspector.title">${SIGNER_TITLES.map((t) => `<option ${t === ins.title ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select></label>
-      <label class="field"><span>טלפון</span><input data-setbind="inspector.phone" value="${esc(ins.phone)}" type="tel" dir="ltr"></label>
+      <label class="field"><span>נייד (וואטסאפ)</span><input data-setbind="inspector.phone" value="${esc(ins.phone)}" type="tel" dir="ltr"></label>
       <label class="field"><span>אימייל</span><input data-setbind="inspector.email" value="${esc(ins.email)}" type="email" dir="ltr"></label>
     </div>
     <div class="field"><span>חתימה</span>
@@ -735,26 +958,47 @@ function viewSettings() {
       <button class="btn small" data-action="upload-signature">🖼 העלה תמונת חתימה</button></div>
     </div>
   </section>
-  <section class="panel" data-settings>
-    <h2 class="panel-h">חברה ולוגו <small>מופיעים בכותרת הדוח</small></h2>
-    <label class="field"><span>שם החברה</span><input data-setbind="company.name" value="${esc(st.company.name)}"></label>
+  <section class="panel">
+    <h2 class="panel-h">חברה, לוגו וסלוגן <small>מופיעים בראש כל דוח</small></h2>
+    <div class="grid2">
+      <label class="field"><span>שם החברה</span><input data-setbind="company.name" value="${esc(st.company.name)}"></label>
+      <label class="field"><span>סלוגן</span><input data-setbind="company.slogan" value="${esc(st.company.slogan)}" placeholder="לדוגמה: בטיחות מתחילה בתכנון"></label>
+    </div>
     <div class="field"><span>לוגו</span>
       <div class="logo-box">${st.company.logo ? `<img src="${st.company.logo}" alt="לוגו">` : '<span class="muted">אין לוגו</span>'}</div>
       <div class="row-btns"><button class="btn small" data-action="upload-logo">העלה לוגו</button>${st.company.logo ? '<button class="btn small" data-action="remove-logo">הסר</button>' : ''}</div>
     </div>
   </section>
-  <section class="panel" data-settings>
+  <section class="panel">
+    <h2 class="panel-h">תפוצה קבועה <small>מי מקבל כל סוג דוח</small></h2>
+    <p class="muted tiny">אנשי הקשר של האתר (מזמין, מבצע, ובסיכון בלתי קביל גם מנהל אתר ומנהל עבודה) נכנסים לתפוצה אוטומטית. כאן מוסיפים אנשים קבועים נוספים.</p>
+    <label class="check"><input type="checkbox" data-setbind="distribution.includeSelf" ${st.distribution.includeSelf !== false ? 'checked' : ''}><span>לשלוח עותק גם לעצמי (עורך הדו"ח)</span></label>
+    ${peopleEditor('visit', 'דו"ח ביקור (סיכון קביל)')}
+    ${peopleEditor('risk', 'הודעת סיכון בלתי קביל')}
+  </section>
+  <section class="panel">
+    <h2 class="panel-h">רשימות הבדיקה בדו"ח ביקור <small>לדוחות חדשים</small></h2>
+    <p class="muted tiny">שורה לכל פריט. "-" בתחילת שורה = תת-פריט, ":" בסוף שורה = כותרת קבוצה. אפשר גם לערוך רשימה בתוך דוח ספציפי בלבד, עם "✎ ערוך רשימה".</p>
+    ${templatesEditor()}
+  </section>
+  <section class="panel">
+    <h2 class="panel-h">טפסים מותאמים <small>צ'ק ליסט משלך לתחומים אחרים</small></h2>
+    ${st.customForms.map((f) => `<a class="row" href="#/forms/${f.id}"><span class="row-ico custom">☑</span><span class="row-main"><b>${esc(f.name)}</b><small>${f.sections.length} סעיפים</small></span><span class="row-end">←</span></a>`).join('')}
+    <button class="btn small" data-action="form-new">+ טופס חדש</button>
+  </section>
+  <section class="panel">
     <h2 class="panel-h">נוסח קבוע</h2>
     <label class="field"><span>סיכום מקצועי (ברירת מחדל לדוח ביקור)</span><textarea data-setbind="defaultSummary" rows="6">${esc(st.defaultSummary)}</textarea></label>
   </section>
   <section class="panel">
-    <h2 class="panel-h">חשבון</h2>
+    <h2 class="panel-h">חשבון ושמירה</h2>
     <div class="account">
       <span class="avatar">${esc((state.user.displayName || state.user.email || '?').trim()[0].toUpperCase())}</span>
       <span class="row-main"><b>${esc(state.user.displayName || '')}</b><small dir="ltr">${esc(state.user.email || '')}</small></span>
       <button class="btn small" data-action="logout">התנתק</button>
     </div>
-    <p class="muted tiny">הנתונים נשמרים בענן ומסונכרנים בין כל המכשירים שמחוברים לחשבון הזה, ונשמר גם עותק במכשיר לעבודה בלי קליטה.</p>
+    <label class="check"><input type="checkbox" data-action="toggle-cloud" ${cloudEnabled() ? 'checked' : ''}><span><b>שמירה בענן</b> (חינם) — גיבוי אוטומטי וסנכרון בין הטלפון למחשב. כשכבוי, הנתונים נשמרים רק במכשיר הזה.</span></label>
+    <p class="muted tiny">בכל מקרה נשמר עותק במכשיר, לעבודה בלי קליטה. ההגדרה הזו חלה על המכשיר הנוכחי.</p>
   </section>
   <section class="panel">
     <h2 class="panel-h">גיבוי ונתונים</h2>
@@ -764,8 +1008,57 @@ function viewSettings() {
       <button class="btn" data-action="restore">⬆ שחזר מגיבוי</button>
       <button class="btn" data-action="theme">◐ ערכת צבעים</button>
     </div>
-    <p class="muted tiny mono">${state.sites.length} אתרים · ${state.reports.length} דוחות</p>
+    <p class="muted tiny mono">${state.sites.length} אתרים · ${savedReports().length} דוחות</p>
   </section>`;
+}
+
+// ---------- custom forms (סעיף 20) ----------
+function viewForms() {
+  const forms = state.settings.customForms;
+  return `
+  <div class="page-h"><a class="back" href="#/settings">→</a><h1>טפסים מותאמים</h1><button class="btn" data-action="form-new">+ טופס חדש</button></div>
+  <section class="panel">
+    <p class="muted">טופס מותאם הוא צ'ק ליסט ריק שאתה קובע בו את הכותרת, הסעיפים והפריטים, לשימוש בתחומים אחרים. הוא עובד כמו הדוחות הרגילים: אתר ופרטים כלליים, סימון לכל שורה, הערות, תמונות, חתימה והפקה ל-PDF ול-Word.</p>
+    ${forms.length ? forms.map((f) => `<a class="row" href="#/forms/${f.id}"><span class="row-ico custom">☑</span><span class="row-main"><b>${esc(f.name)}</b><small>${esc(f.title)} · ${f.sections.length} סעיפים</small></span><span class="row-end">←</span></a>`).join('') : '<p class="empty">עוד אין טפסים מותאמים</p>'}
+  </section>`;
+}
+
+function viewForm(id) {
+  const i = state.settings.customForms.findIndex((f) => f.id === id);
+  if (i < 0) return notFound();
+  const f = state.settings.customForms[i];
+  const p = `customForms.${i}`;
+  return `
+  <div class="page-h"><a class="back" href="#/forms">→</a><h1>${esc(f.name)}</h1><small class="saved" id="saved"></small>
+    <a class="btn small primary" href="#/new/custom/${f.id}">☑ דוח חדש מהטופס</a></div>
+  <section class="panel">
+    <div class="grid2">
+      <label class="field"><span>שם הטופס (לרשימות)</span><input data-setbind="${p}.name" value="${esc(f.name)}"></label>
+      <label class="field"><span>כותרת הדוח</span><input data-setbind="${p}.title" value="${esc(f.title)}" placeholder='לדוגמה: דו"ח ביקורת בטיחות אש'></label>
+    </div>
+    <label class="field"><span>שורת משנה מתחת לכותרת <small class="muted">(רשות, למשל בסיס חוקי)</small></span><input data-setbind="${p}.subtitle" value="${esc(f.subtitle || '')}"></label>
+    <label class="field"><span>כותרת שדה הסיכום</span><input data-setbind="${p}.summaryLabel" value="${esc(f.summaryLabel || '')}"></label>
+  </section>
+  ${f.sections.map((s, j) => `<section class="panel">
+    <h2 class="panel-h">סעיף ${j + 2} <button class="link-btn danger" data-action="form-section-remove" data-i="${i}" data-j="${j}">מחק סעיף</button></h2>
+    <div class="grid2">
+      <label class="field"><span>כותרת הסעיף</span><input data-setbind="${p}.sections.${j}.title" value="${esc(s.title)}"></label>
+      <label class="field"><span>כותרת עמודת הפריטים</span><input data-setbind="${p}.sections.${j}.head" value="${esc(s.head || '')}"></label>
+    </div>
+    <div class="grid3">
+      <label class="field"><span>סימון חיובי</span><input data-setbind="${p}.sections.${j}.labels.ok" value="${esc(s.labels?.ok || 'תקין')}"></label>
+      <label class="field"><span>סימון שלילי</span><input data-setbind="${p}.sections.${j}.labels.bad" value="${esc(s.labels?.bad || 'לא תקין')}"></label>
+      <label class="field"><span>סימון שלישי</span><input data-setbind="${p}.sections.${j}.labels.na" value="${esc(s.labels?.na || 'לא רלוונטי')}"></label>
+    </div>
+    <label class="field"><span>פריטים — שורה לכל פריט <small class="muted">("-" בהתחלה = תת-פריט, ":" בסוף = כותרת)</small></span>
+      <textarea data-setbind="${p}.sections.${j}.items" rows="7">${esc(s.items || '')}</textarea></label>
+    <label class="field"><span>כותרת שדה הפירוט</span><input data-setbind="${p}.sections.${j}.textLabel" value="${esc(s.textLabel || '')}"></label>
+  </section>`).join('')}
+  <div class="row-btns">
+    <button class="btn" data-action="form-section-add" data-i="${i}">+ הוסף סעיף</button>
+    <button class="btn" data-action="form-duplicate" data-i="${i}">⧉ שכפל טופס</button>
+    <button class="btn ghost danger-text" data-action="form-delete" data-i="${i}">מחק טופס</button>
+  </div>`;
 }
 
 function notFound() {
@@ -812,17 +1105,20 @@ function render() {
   let html;
   switch (route) {
     case '': html = viewHome(); break;
-    case 'new': html = viewNew(args[0] === 'risk' ? 'risk' : 'visit'); break;
+    case 'new': html = viewNew(['risk', 'custom'].includes(args[0]) ? args[0] : 'visit', args[1]); break;
     case 'sites': html = args[0] ? viewSite(args[0]) : viewSites(); break;
     case 'reports': html = viewReports(); break;
     case 'r': html = viewReport(args[0], args[1]); break;
     case 'settings': html = viewSettings(); break;
+    case 'forms': html = args[0] ? viewForm(args[0]) : viewForms(); break;
     default: html = notFound();
   }
   $view.innerHTML = html;
-  document.querySelectorAll('.nav a').forEach((a) => a.classList.toggle('on', a.dataset.route === (route === 'new' ? 'new' : route || 'home')));
+  const navRoute = route === 'new' ? 'new' : route === 'forms' ? 'settings' : route || 'home';
+  document.querySelectorAll('.nav a').forEach((a) => a.classList.toggle('on', a.dataset.route === navRoute));
   if (route === 'r' && args[1] === 'preview') fitPaper();
   updateCrumb();
+  updateSyncBadge();
 }
 
 function rerender() {
@@ -833,12 +1129,12 @@ function rerender() {
 
 function updateCrumb() {
   const { route, args } = current;
-  const map = { '': '~', new: '~/חדש', sites: '~/אתרים', reports: '~/דוחות', settings: '~/הגדרות', r: '~/דוח' };
+  const map = { '': '~', new: '~/חדש', sites: '~/אתרים', reports: '~/דוחות', settings: '~/הגדרות', forms: '~/טפסים', r: '~/דוח' };
   let c = map[route] ?? '~';
   if (route === 'sites' && args[0]) c += `/${site(args[0])?.name || ''}`;
   if (route === 'r') {
     const r = report(args[0]);
-    if (r) c = `~/${site(r.siteId)?.name || 'אתר'}/${REPORT_TYPES[r.type].name}`;
+    if (r) c = `~/${site(r.siteId)?.name || 'אתר'}/${reportTitle(r)}`;
   }
   document.getElementById('crumb').textContent = c;
 }
@@ -877,7 +1173,9 @@ document.addEventListener('input', (e) => {
     if (!r) return;
     setPath(r, el.dataset.bind, inputValue(el));
     persistReport(r);
-    if (el.type === 'checkbox' || el.tagName === 'SELECT') refreshSteps(r);
+    if (el.dataset.rerender) {
+      saveReport(r).then(rerender);
+    } else if (el.type === 'checkbox' || el.tagName === 'SELECT') refreshSteps(r);
   } else if (el.dataset.sbind) {
     const s = site(el.closest('[data-site-id]')?.dataset.siteId);
     if (!s) return;
@@ -886,43 +1184,70 @@ document.addEventListener('input', (e) => {
     setPath(s, el.dataset.sbind, el.value);
     persistSite(s);
   } else if (el.dataset.setbind) {
-    setPath(state.settings, el.dataset.setbind, el.value);
+    setPath(state.settings, el.dataset.setbind, inputValue(el));
+    persistSettings();
+  } else if (el.dataset.template) {
+    state.settings.templates[el.dataset.template] = el.value;
     persistSettings();
   } else if (el.dataset.action === 'filter-reports') {
-    const q = el.value.trim();
-    const reps = [...state.reports]
-      .filter((r) => !q || (site(r.siteId)?.name || '').includes(q))
-      .sort((a, b) => (b.visitDate || '').localeCompare(a.visitDate || ''));
-    document.getElementById('report-list').innerHTML = reps.map(reportRow).join('') || '<p class="empty">לא נמצאו דוחות</p>';
+    document.getElementById('report-list').innerHTML = reportListHTML(el.value.trim());
   }
 });
 document.addEventListener('change', (e) => {
-  if (e.target.dataset.bind && e.target.tagName === 'SELECT') e.target.dispatchEvent(new Event('input', { bubbles: true }));
+  const el = e.target;
+  if ((el.dataset.bind || el.dataset.setbind) && el.tagName === 'SELECT') el.dispatchEvent(new Event('input', { bubbles: true }));
+  if (el.dataset.action === 'recip-toggle') actions['recip-toggle'](el);
+  if (el.dataset.action === 'toggle-cloud') actions['toggle-cloud'](el);
 });
 
 function refreshSteps(r) {
-  const steps = STEPS[r.type];
+  const steps = getSteps(r);
   document.querySelectorAll('.steps .step:not(.preview)').forEach((a, i) => {
-    const done = stepProgress(r, steps[i].id);
+    const done = stepProgress(r, steps[i]);
     a.classList.toggle('done', done);
     a.querySelector('.step-n').textContent = done ? '✓' : i + 1;
   });
 }
 
 // ---------------- actions ----------------
-async function createReport(type, siteId, extra = {}) {
+function nextNumber(siteId) {
+  const nums = savedReports().filter((r) => r.siteId === siteId).map((r) => parseInt(r.number, 10)).filter((n) => n > 0);
+  return String((nums.length ? Math.max(...nums) : 0) + 1);
+}
+
+// דוח חדש נוצר כטיוטה בזיכרון בלבד, ונשמר רק עם השינוי הראשון (סעיף 18)
+function createReport(type, siteId, extra = {}, { save = false } = {}) {
   const ins = state.settings.inspector;
-  const r = {
-    id: uid(), type, siteId, status: 'draft', number: '',
+  const r = normalizeReport({
+    id: uid(), type, siteId, status: 'draft', number: nextNumber(siteId),
     visitDate: today(), reportDate: today(),
-    data: newReportData(type), photos: [],
+    data: newReportData(type, { templates: state.settings.templates }), photos: [],
     inspector: { name: ins.name, title: ins.title, signature: ins.signature },
-    createdAt: Date.now(),
+    createdAt: Date.now(), updatedAt: Date.now(),
     ...extra,
-  };
-  await saveReport(r);
+  });
+  r._draft = true;
+  state.reports.push(r);
+  if (save) saveReport(r);
   location.hash = `#/r/${r.id}/0`;
   return r;
+}
+
+function startReport(type, siteId, formId) {
+  const open = savedReports()
+    .filter((r) => r.siteId === siteId && r.type === type && r.status !== 'sent' && (type !== 'custom' || r.data.formId === formId))
+    .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+  if (open && confirm(`יש כבר טיוטה פתוחה לאתר הזה: ${reportTitle(open)}${open.number ? ` #${open.number}` : ''} מ-${formatDate(open.visitDate)}.\n\nלהמשיך לערוך אותה?\n(אישור = להמשיך בטיוטה · ביטול = לפתוח דוח חדש)`)) {
+    location.hash = `#/r/${open.id}/0`;
+    return;
+  }
+  const extra = {};
+  if (type === 'custom') {
+    const form = state.settings.customForms.find((f) => f.id === formId);
+    if (!form) return toast('הטופס לא נמצא', 'danger');
+    extra.data = newReportData('custom', { form });
+  }
+  createReport(type, siteId, extra);
 }
 
 function openSignature(onSave) {
@@ -956,9 +1281,24 @@ async function makeFile(r, kind) {
   });
 }
 
+// שיתוף קובץ ה-PDF דרך חלון השיתוף של המכשיר (וואטסאפ, מייל, דרייב...). מחזיר false אם לא נתמך
+async function shareFile(r, text) {
+  const f = await makeFile(r, 'pdf');
+  if (navigator.canShare?.({ files: [f] })) {
+    try {
+      await navigator.share({ files: [f], title: f.name, text });
+      return true;
+    } catch (err) {
+      if (err.name === 'AbortError') return 'cancel';
+    }
+  }
+  download(f, f.name);
+  return false;
+}
+
 const actions = {
-  async 'new-report'(el) {
-    await createReport(el.dataset.type, el.dataset.site);
+  'new-report'(el) {
+    startReport(el.dataset.type, el.dataset.site, el.dataset.form);
   },
   async 'add-site'() {
     const s = { id: uid(), name: '', createdAt: Date.now() };
@@ -966,7 +1306,7 @@ const actions = {
     location.hash = `#/sites/${s.id}`;
   },
   async 'delete-site'(el) {
-    const n = state.reports.filter((r) => r.siteId === el.dataset.site).length;
+    const n = savedReports().filter((r) => r.siteId === el.dataset.site).length;
     if (!confirm(n ? `למחוק את האתר ואת ${n} הדוחות שלו?` : 'למחוק את האתר?')) return;
     await deleteSite(el.dataset.site);
     location.hash = '#/sites';
@@ -977,32 +1317,62 @@ const actions = {
     await deleteReport(r);
     location.hash = '#/';
   },
+  'reports-mode'(el) {
+    ui.reportsMode = el.dataset.mode;
+    rerender();
+  },
   tri(el) {
     const r = report(current.args[0]);
     const row = getPath(r, el.dataset.path);
     row.status = row.status === el.dataset.val ? '' : el.dataset.val;
     persistReport(r);
     rerender();
-    if (row.status === 'bad') {
-      const ta = document.querySelector(`[data-bind="${el.dataset.path}.note"]`);
-      ta?.focus({ preventScroll: true });
-    }
+    if (row.status === 'bad') document.querySelector(`[data-bind="${el.dataset.path}.note"]`)?.focus({ preventScroll: true });
+  },
+  'open-note'(el) {
+    ui.openNotes.add(el.dataset.id);
+    rerender();
+    document.querySelector(`[data-bind="${el.dataset.path}.note"]`)?.focus({ preventScroll: true });
   },
   'tri-fill'(el) {
     const r = report(current.args[0]);
-    r.data[el.dataset.key].forEach((x) => {
-      if (!x.status && (!x.other || x.label)) x.status = 'ok';
+    r.data.sections[+el.dataset.si].rows.forEach((x) => {
+      if (!x.status && !x.hidden && !x.header) x.status = 'ok';
     });
     persistReport(r);
     rerender();
   },
-  'check-all'(el) {
+  'edit-list'(el) {
     const r = report(current.args[0]);
-    const list = el.dataset.group === 'prestartDocs' ? PRESTART_DOCS : PRESTART_CHECKS;
-    const all = list.every((i) => r.data[el.dataset.group][i.id]);
-    list.forEach((i) => (r.data[el.dataset.group][i.id] = !all));
+    const key = `${r.id}:${el.dataset.key}`;
+    ui.editList = ui.editList === key ? null : key;
+    rerender();
+  },
+  'row-hide'(el) {
+    const r = report(current.args[0]);
+    const sec = r.data.sections[+el.dataset.si];
+    const row = sec.rows[+el.dataset.j];
+    // שורה שהוספת ידנית נמחקת; שורה מהתבנית מוסתרת (ואפשר להחזיר אותה)
+    if (row.custom) sec.rows.splice(+el.dataset.j, 1);
+    else row.hidden = true;
+    r.photos = r.photos.map((p) => (p.ref === `${sec.key}:${row.id}` ? { ...p, ref: sec.key } : p));
     persistReport(r);
     rerender();
+  },
+  'row-restore'(el) {
+    const r = report(current.args[0]);
+    delete getPath(r, el.dataset.path).hidden;
+    persistReport(r);
+    rerender();
+  },
+  'add-row'(el) {
+    const r = report(current.args[0]);
+    const rows = r.data.sections[+el.dataset.si].rows;
+    rows.push({ id: rid(), label: '', status: '', note: '', level: 0, header: !!el.dataset.header, custom: true });
+    persistReport(r);
+    rerender();
+    const inputs = document.querySelectorAll('.edit-row input');
+    inputs[inputs.length - 1]?.focus();
   },
   'toggle-reason'(el) {
     const r = report(current.args[0]);
@@ -1018,8 +1388,13 @@ const actions = {
     await saveReport(r);
     const data = newReportData('risk');
     data.riskText = `${row.label}${row.note ? `: ${row.note}` : ''}`;
-    await createReport('risk', r.siteId, { data, visitDate: r.visitDate });
-    toast('נפתחה הודעת סיכון בלתי קביל — יש להפיץ מיידית', 'danger');
+    data.fromReport = r.id;
+    // התמונות של השורה עוברות גם להודעה
+    const [key] = el.dataset.path.split('.rows.');
+    const sec = getPath(r, key);
+    const photos = r.photos.filter((p) => p.ref === `${sec.key}:${row.id}`).map((p) => ({ ...p, id: uid(), ref: 'risk', _up: false }));
+    createReport('risk', r.siteId, { data, visitDate: r.visitDate, photos }, { save: true });
+    toast('נפתחה הודעת סיכון בלתי קביל (מסמך נפרד) — יש להפיץ מיידית', 'danger');
   },
   'mx-cell'(el) {
     const r = report(current.args[0]);
@@ -1034,17 +1409,26 @@ const actions = {
     if (!files.length) return;
     for (const f of files) {
       const img = await compressImage(f);
-      r.photos.push({ id: uid(), ...img, caption: el.dataset.caption || '' });
+      r.photos.push({ id: uid(), ...img, caption: el.dataset.caption || '', ref: el.dataset.ref || '' });
     }
     await saveReport(r);
-    toast(`נוספו ${files.length} תמונות לנספח`);
+    toast(el.dataset.ref ? `📷 נוספה לדוח ליד: ${photoPlace(r, el.dataset.ref).split(' › ').pop().slice(0, 40)}` : `נוספו ${files.length} תמונות לנספח`);
     rerender();
   },
   async 'del-photo'(el) {
     const r = report(current.args[0]);
-    const [removed] = r.photos.splice(+el.dataset.i, 1);
+    const i = r.photos.findIndex((p) => p.id === el.dataset.id);
+    if (i < 0) return;
+    const [removed] = r.photos.splice(i, 1);
     await saveReport(r);
-    if (removed) toCloud(cloud.removePhoto(removed.id));
+    toCloud(cloud.removePhoto(removed.id));
+    rerender();
+  },
+  async 'photo-to-appendix'(el) {
+    const r = report(current.args[0]);
+    const p = r.photos.find((x) => x.id === el.dataset.id);
+    if (p) p.ref = '';
+    await saveReport(r);
     rerender();
   },
   'sign-here'() {
@@ -1120,29 +1504,143 @@ const actions = {
     const r = report(current.args[0]);
     busy(el, true);
     try {
-      const f = await makeFile(r, 'pdf');
-      if (navigator.canShare?.({ files: [f] })) {
-        await navigator.share({ files: [f], title: f.name, text: REPORT_TYPES[r.type].title });
-      } else {
-        download(f, f.name);
-        toast('השיתוף אינו נתמך בדפדפן זה — הקובץ הורד');
-      }
+      const res = await shareFile(r, shareMessage(r));
+      if (res === false) toast('השיתוף אינו נתמך בדפדפן זה — הקובץ הורד');
+      if (res !== 'cancel') await rememberRecipients(r);
     } catch (err) {
-      if (err.name !== 'AbortError') toast('השיתוף נכשל', 'danger');
+      console.error(err);
+      toast('השיתוף נכשל', 'danger');
     } finally {
       busy(el, false);
+      rerender();
     }
   },
-  print() {
-    window.print();
+  // ---- תפוצה ----
+  async 'recip-toggle'(el) {
+    const r = report(current.args[0]);
+    ownRecipients(r)[+el.dataset.i].on = el.checked;
+    await saveReport(r);
+    rerender();
+  },
+  async 'recip-remove'(el) {
+    const r = report(current.args[0]);
+    ownRecipients(r).splice(+el.dataset.i, 1);
+    await saveReport(r);
+    rerender();
+  },
+  async 'recip-reset'() {
+    const r = report(current.args[0]);
+    r.recipients = undefined;
+    await saveReport(r);
+    rerender();
+  },
+  'recip-add-toggle'() {
+    ui.addRecipient = !ui.addRecipient;
+    rerender();
+    document.querySelector('.add-recip input')?.focus();
+  },
+  async 'send-wa'(el) {
+    const r = report(current.args[0]);
+    const x = recipients(r)[+el.dataset.i];
+    busy(el, true);
+    try {
+      if (isMobile() && navigator.canShare) {
+        const res = await shareFile(r, shareMessage(r, x.name));
+        if (res === true) toast(`בחר וואטסאפ ואת ${x.name || 'איש הקשר'}`);
+        if (res === 'cancel') return;
+        if (res === false) window.open(`https://wa.me/${waNumber(x.phone)}?text=${encodeURIComponent(shareMessage(r, x.name))}`, '_blank');
+      } else {
+        const f = await makeFile(r, 'pdf');
+        download(f, f.name);
+        window.open(`https://wa.me/${waNumber(x.phone)}?text=${encodeURIComponent(shareMessage(r, x.name))}`, '_blank');
+        toast('ה-PDF הורד — צרף אותו לשיחה בוואטסאפ');
+      }
+      await rememberRecipients(r);
+    } finally {
+      busy(el, false);
+      rerender();
+    }
+  },
+  async 'send-gmail'(el) {
+    const r = report(current.args[0]);
+    await openMail(r, [recipients(r)[+el.dataset.i]], 'gmail', el);
+  },
+  async 'send-gmail-all'(el) {
+    const r = report(current.args[0]);
+    await openMail(r, recipients(r).filter((x) => x.on), 'gmail', el);
+  },
+  async 'send-mail-all'(el) {
+    const r = report(current.args[0]);
+    await openMail(r, recipients(r).filter((x) => x.on), 'mailto', el);
   },
   async 'mark-sent'() {
     const r = report(current.args[0]);
     r.status = r.status === 'sent' ? 'draft' : 'sent';
     r.sentAt = r.status === 'sent' ? Date.now() : null;
+    ui.askSent = null;
     await saveReport(r);
     toast(r.status === 'sent' ? 'סומן כהופץ ✓' : 'הוחזר לטיוטה');
     rerender();
+  },
+  // ---- הגדרות ----
+  async 'dist-add'(el) {
+    state.settings.distribution[el.dataset.type].push({ name: '', role: '', phone: '', email: '' });
+    await saveSettings();
+    rerender();
+  },
+  async 'dist-remove'(el) {
+    state.settings.distribution[el.dataset.type].splice(+el.dataset.i, 1);
+    await saveSettings();
+    rerender();
+  },
+  async 'template-reset'(el) {
+    delete state.settings.templates[el.dataset.key];
+    await saveSettings();
+    rerender();
+  },
+  async 'form-new'() {
+    const f = newCustomForm();
+    state.settings.customForms.push(f);
+    await saveSettings();
+    location.hash = `#/forms/${f.id}`;
+  },
+  async 'form-section-add'(el) {
+    const f = state.settings.customForms[+el.dataset.i];
+    f.sections.push({ id: rid(), title: `סעיף ${f.sections.length + 1}`, head: 'הפריט', labels: { ok: 'תקין', bad: 'לא תקין', na: 'לא רלוונטי' }, textLabel: 'פירוט והערות', items: '' });
+    await saveSettings();
+    rerender();
+  },
+  async 'form-section-remove'(el) {
+    if (!confirm('למחוק את הסעיף מהטופס?')) return;
+    state.settings.customForms[+el.dataset.i].sections.splice(+el.dataset.j, 1);
+    await saveSettings();
+    rerender();
+  },
+  async 'form-duplicate'(el) {
+    const f = JSON.parse(JSON.stringify(state.settings.customForms[+el.dataset.i]));
+    Object.assign(f, { id: rid(), name: `${f.name} (עותק)` });
+    f.sections.forEach((s) => (s.id = rid()));
+    state.settings.customForms.push(f);
+    await saveSettings();
+    location.hash = `#/forms/${f.id}`;
+  },
+  async 'form-delete'(el) {
+    if (!confirm('למחוק את הטופס? דוחות שכבר נוצרו ממנו יישארו.')) return;
+    state.settings.customForms.splice(+el.dataset.i, 1);
+    await saveSettings();
+    location.hash = '#/forms';
+  },
+  'toggle-cloud'(el) {
+    const on = el.checked;
+    try { localStorage.setItem('bakar-cloud', on ? 'on' : 'off'); } catch {}
+    if (on) {
+      startCloudSync(state.user);
+      toast('שמירה בענן הופעלה — הנתונים מסונכרנים');
+    } else {
+      cloud.stopSync();
+      toast('שמירה בענן כובתה — הנתונים נשמרים רק במכשיר הזה');
+    }
+    updateSyncBadge();
   },
   async backup() {
     const data = await exportBackup();
@@ -1155,7 +1653,7 @@ const actions = {
     inp.onchange = async () => {
       try {
         await importData(parseBackup(JSON.parse(await inp.files[0].text())));
-        toast('הגיבוי שוחזר ונשמר בענן ✓');
+        toast('הגיבוי שוחזר ✓');
         rerender();
       } catch (err) {
         toast(err.message || 'שחזור נכשל', 'danger');
@@ -1200,6 +1698,29 @@ const actions = {
   },
 };
 
+async function openMail(r, list, kind, el) {
+  const to = list.map((x) => x.email).filter(Boolean);
+  if (!to.length) return toast('אין כתובות מייל לנמענים שנבחרו');
+  busy(el, true);
+  try {
+    const subject = `${reportTitle(r)}${r.number ? ` ${r.number}` : ''} – ${site(r.siteId)?.name || ''} – ${formatDate(r.visitDate)}`;
+    const body = shareMessage(r, list.length === 1 ? list[0].name : '');
+    if (!isMobile()) {
+      const f = await makeFile(r, 'pdf');
+      download(f, f.name);
+      toast('ה-PDF הורד — צרף אותו למייל');
+    }
+    const url = kind === 'gmail'
+      ? `https://mail.google.com/mail/?view=cm&fs=1&to=${encodeURIComponent(to.join(','))}&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`
+      : `mailto:${to.map(encodeURIComponent).join(',')}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    window.open(url, kind === 'gmail' ? '_blank' : '_self');
+    await rememberRecipients(r);
+  } finally {
+    busy(el, false);
+    rerender();
+  }
+}
+
 document.addEventListener('click', (e) => {
   const cell = e.target.closest('.mx-cell[data-sev]');
   if (cell) return actions['mx-cell'](cell);
@@ -1226,13 +1747,14 @@ function showAuthError(err) {
 
 document.addEventListener('submit', async (e) => {
   const form = e.target;
-  if (form.dataset.action === 'login' || form.dataset.action === 'signup') {
+  const action = form.dataset.action;
+  if (action === 'login' || action === 'signup') {
     e.preventDefault();
     const f = new FormData(form);
     const btn = form.querySelector('button');
     busy(btn, true);
     try {
-      if (form.dataset.action === 'signup') await cloud.signUp(f.get('email').trim(), f.get('password'), f.get('name')?.trim());
+      if (action === 'signup') await cloud.signUp(f.get('email').trim(), f.get('password'), f.get('name')?.trim());
       else await cloud.signIn(f.get('email').trim(), f.get('password'));
     } catch (err) {
       showAuthError(err);
@@ -1241,17 +1763,38 @@ document.addEventListener('submit', async (e) => {
     }
     return;
   }
-  if (form.dataset.action !== 'new-site-report') return;
+  if (action === 'recip-add') {
+    e.preventDefault();
+    const r = report(current.args[0]);
+    const f = Object.fromEntries(new FormData(form));
+    ownRecipients(r).push({ id: uid(), name: f.name.trim(), role: f.role.trim(), phone: f.phone.trim(), email: f.email.trim(), on: true, src: 'added' });
+    ui.addRecipient = false;
+    await saveReport(r);
+    rerender();
+    return;
+  }
+  if (action !== 'new-site-report') return;
   e.preventDefault();
   const name = new FormData(form).get('name').trim();
   if (!name) return;
   const s = { id: uid(), name, createdAt: Date.now() };
   await saveSite(s);
-  await createReport(form.dataset.type, s.id);
+  startReport(form.dataset.type, s.id, form.dataset.form);
 });
 
 // ---------------- boot ----------------
+// יציאה מדוח חדש שלא נערך — הטיוטה נזרקת ולא נוצרת כפילות (סעיף 18)
+let lastReportId = null;
 window.addEventListener('hashchange', () => {
+  const parts = location.hash.replace(/^#\/?/, '').split('/');
+  const nowId = parts[0] === 'r' ? parts[1] : null;
+  if (lastReportId && lastReportId !== nowId) {
+    const prev = report(lastReportId);
+    if (prev?._draft) state.reports = state.reports.filter((x) => x !== prev);
+    ui.askSent = null;
+    ui.addRecipient = false;
+  }
+  lastReportId = nowId;
   render();
   window.scrollTo(0, 0);
 });
@@ -1283,7 +1826,7 @@ cloud.onUser(async (user) => {
     toast(`הועברו לחשבון ${legacy.reports.length} דוחות ו-${legacy.sites.length} אתרים מהמכשיר`);
   }
   render();
-  startCloudSync(user);
+  if (cloudEnabled()) startCloudSync(user);
 });
 
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {

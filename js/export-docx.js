@@ -29,7 +29,7 @@ export async function exportDocx(model) {
   const D = window.docx;
   const {
     Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, WidthType, AlignmentType,
-    BorderStyle, ShadingType, ImageRun, Header, VerticalAlign, TableLayoutType,
+    BorderStyle, ShadingType, ImageRun, Header, VerticalAlign, TableLayoutType, CheckBox,
   } = D;
 
   const run = (text, o = {}) =>
@@ -87,7 +87,12 @@ export async function exportDocx(model) {
       alignment: o.align || AlignmentType.CENTER,
     });
 
-  const box = (on) => (on ? '☒' : '☐');
+  // תיבת סימון אמיתית של Word (content control) — אפשר ללחוץ עליה בתוך Word ולשנות (סעיף 19)
+  const box = (on) => new CheckBox({
+    checked: !!on,
+    checkedState: { value: '2612', font: 'MS Gothic' },
+    uncheckedState: { value: '2610', font: 'MS Gothic' },
+  });
   const out = [];
 
   for (const b of model.blocks) {
@@ -118,26 +123,30 @@ export async function exportDocx(model) {
         out.push(table(b.rows.map(([k, v]) => new TableRow({
           children: [
             cell(para(run(`${k}:`, { bold: true }), { after: 0 }), { width: 2600, fill: 'F2F2F2' }),
-            cell(para(run(v || ''), { after: 0 }), { width: 6400 }),
+            cell(para(lines(v || ''), { after: 0 }), { width: 6400 }),
           ],
         })), [2600, 6400]));
         break;
       case 'checklist':
-        b.items.forEach((i) => out.push(para([run(`${box(i.checked)}  `), run(i.label)], { indent: 360 + i.level * 500, after: 40 })));
+        b.items.forEach((i) => out.push(para([box(i.checked), run('  '), run(i.label)], { indent: 360 + i.level * 500, after: 40 })));
         break;
       case 'tri': {
         const w = [4800, 1400, 1400, 1400];
+        const labels = b.labels || Object.fromEntries(Object.entries(STATUS).map(([k, v]) => [k, v.label]));
         const head = new TableRow({
           tableHeader: true,
-          children: [b.head, ...['ok', 'bad', 'na'].map((k) => STATUS[k].label)].map((t, i) =>
+          children: [b.head, ...['ok', 'bad', 'na'].map((k) => labels[k])].map((t, i) =>
             cell(para(run(t, { bold: true }), { align: i ? AlignmentType.CENTER : AlignmentType.START, after: 0 }), { width: w[i], fill: 'D9D9D9' })),
         });
         const rows = b.rows.map((r) => new TableRow({
-          children: [
-            cell(para(run(r.label), { after: 0 }), { width: w[0] }),
-            ...['ok', 'bad', 'na'].map((k, i) => cell(para(run(box(r.status === k), { size: 26 }), { align: AlignmentType.CENTER, after: 0 }),
-              { width: w[i + 1], fill: r.status === 'bad' && k === 'bad' ? 'FDE2E1' : undefined })),
-          ],
+          children: r.header
+            ? [cell(para(run(r.label, { bold: true }), { after: 0 }), { width: w[0], fill: 'F2F2F2' }),
+              ...w.slice(1).map((x) => cell(para(run(''), { after: 0 }), { width: x, fill: 'F2F2F2' }))]
+            : [
+              cell(para(run(r.label, { bold: r.status === 'bad' }), { after: 0, indent: r.level ? 400 : 0 }), { width: w[0] }),
+              ...['ok', 'bad', 'na'].map((k, i) => cell(para(box(r.status === k), { align: AlignmentType.CENTER, after: 0 }),
+                { width: w[i + 1], fill: r.status === 'bad' && k === 'bad' ? 'FDE2E1' : undefined })),
+            ],
         }));
         out.push(table([head, ...rows], w));
         break;
@@ -196,12 +205,12 @@ export async function exportDocx(model) {
         break;
       }
       case 'photos':
-        out.push(para(run(b.label, { bold: true, underline: true }), { before: 300 }));
-        out.push(para(run(b.sub, { italics: true })));
-        for (const [i, p] of b.items.entries()) {
-          const sz = fit({ w: p.w || 800, h: p.h || 600 }, 560, 420);
+        out.push(para(run(b.label, { bold: true, underline: true }), { before: b.inline ? 120 : 300, keepNext: true }));
+        if (b.sub) out.push(para(run(b.sub, { italics: true })));
+        for (const p of b.items) {
+          const sz = fit({ w: p.w || 800, h: p.h || 600 }, b.inline ? 420 : 560, b.inline ? 300 : 420);
           out.push(para(new ImageRun({ data: dataUrlToBytes(p.src), transformation: sz }), { align: AlignmentType.CENTER, before: 200, after: 40, keepNext: true }));
-          out.push(para(run(`תמונה ${i + 1}${p.caption ? ` — ${p.caption}` : ''}`, { size: 18, italics: true }), { align: AlignmentType.CENTER }));
+          out.push(para(run(`תמונה ${p.n}${p.caption ? ` — ${p.caption}` : ''}`, { size: 18, italics: true }), { align: AlignmentType.CENTER }));
         }
         break;
     }
@@ -214,6 +223,8 @@ export async function exportDocx(model) {
     headerChildren.push(new ImageRun({ data: dataUrlToBytes(model.header.logo), transformation: sz }));
   }
   if (model.header.company) headerChildren.push(run(`  ${model.header.company}`, { bold: true, color: '555555' }));
+  const headerParas = headerChildren.length ? [para(headerChildren, { align: AlignmentType.CENTER, after: 0 })] : [];
+  if (model.header.slogan) headerParas.push(para(run(model.header.slogan, { italics: true, size: 18, color: '777777' }), { align: AlignmentType.CENTER, after: 0 }));
 
   const doc = new Document({
     creator: 'בקר — מערכת דוחות בקר בטיחות',
@@ -221,7 +232,7 @@ export async function exportDocx(model) {
     styles: { default: { document: { run: { font: FONT, size: SIZE, rightToLeft: true } } } },
     sections: [{
       properties: { page: { margin: { top: 1100, bottom: 1000, left: 1100, right: 1100 } } },
-      headers: headerChildren.length ? { default: new Header({ children: [para(headerChildren, { align: AlignmentType.CENTER })] }) } : undefined,
+      headers: headerParas.length ? { default: new Header({ children: headerParas }) } : undefined,
       children: out,
     }],
   });
