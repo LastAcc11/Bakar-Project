@@ -31,6 +31,12 @@ jobs:
         run: node scripts/deploy-hosting.mjs
         env:
           GOOGLE_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+      # בדיקת עשן: הכללים החדשים מתירים לקרוא קישור דוח משותף בלי התחברות (הישנים חוסמים)
+      - name: Check database rules are live
+        run: |
+          code=$(curl -s -o /tmp/r.json -w '%{http_code}' "https://bakar-project-default-rtdb.firebaseio.com/shared/rulescheck$(date +%s)xxxxxxxxxxxx.json")
+          echo "HTTP $code: $(cat /tmp/r.json)"
+          test "$code" = "200"
 
   github-pages:
     runs-on: ubuntu-latest
