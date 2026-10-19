@@ -6,10 +6,10 @@
 //   users/{uid}/photos/{photoId}  תוכן התמונות (dataURL) — נפרד, כדי שרשימת הדוחות תיטען מהר
 import { initializeApp } from '../vendor/firebase/firebase-app.js';
 import {
-  getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword,
-  sendPasswordResetEmail, signInWithPopup, signInWithRedirect, GoogleAuthProvider, signOut, updateProfile,
+  getAuth, onAuthStateChanged, sendEmailVerification, signInWithEmailAndPassword, createUserWithEmailAndPassword,
+  sendPasswordResetEmail, signInWithPopup, connectAuthEmulator, signInWithRedirect, GoogleAuthProvider, signOut, updateProfile,
 } from '../vendor/firebase/firebase-auth.js';
-import { getDatabase, ref, set, get, remove, update, onValue, off } from '../vendor/firebase/firebase-database.js';
+import { getDatabase, ref, set, get, remove, update, onValue, off, connectDatabaseEmulator } from '../vendor/firebase/firebase-database.js';
 import { firebaseConfig } from './firebase-config.js';
 
 const app = initializeApp(firebaseConfig);
@@ -17,7 +17,14 @@ const auth = getAuth(app);
 auth.languageCode = 'he';
 const rtdb = getDatabase(app);
 
-import('../vendor/firebase/firebase-analytics.js')
+// לבדיקות בלבד: http://localhost:8765/?emulator מתחבר לאמולטור המקומי של Firebase במקום לפרויקט האמיתי
+const EMULATOR = ['localhost', '127.0.0.1'].includes(location.hostname) && new URLSearchParams(location.search).has('emulator');
+if (EMULATOR) {
+  connectAuthEmulator(auth, 'http://127.0.0.1:9099', { disableWarnings: true });
+  connectDatabaseEmulator(rtdb, '127.0.0.1', 9000);
+}
+
+if (!EMULATOR) import('../vendor/firebase/firebase-analytics.js')
   .then(async ({ getAnalytics, isSupported }) => (await isSupported()) && getAnalytics(app))
   .catch(() => {});
 
@@ -125,6 +132,71 @@ export function startSync(userId, handlers) {
 }
 
 export const isSyncing = () => !!uid;
+
+// ---------- קבצים מצורפים לאתר (חוזה בקר וכד') ----------
+export async function pushFile(id, dataUrl) {
+  if (uid) await set(path('files', id), dataUrl);
+}
+export async function fetchFile(id) {
+  return uid ? (await get(path('files', id))).val() : null;
+}
+export async function removeFile(id) {
+  if (uid) await remove(path('files', id));
+}
+
+// ---------- קישור שיתוף לדוח: PDF שנשמר בענן ונפתח לכל מי שיש לו את הקישור ----------
+export async function pushShared(token, payload) {
+  await set(ref(rtdb, `shared/${token}`), { ...payload, owner: auth.currentUser.uid, createdAt: Date.now() });
+}
+export async function fetchShared(token) {
+  return (await get(ref(rtdb, `shared/${token}`))).val();
+}
+export async function removeShared(token) {
+  await remove(ref(rtdb, `shared/${token}`));
+}
+
+// ---------- ניהול: הרשאות, מנהלים ושימוש ----------
+export const SUPER_ADMIN = 'hjkhjk876543@gmail.com';
+export const emailKey = (email) => String(email || '').toLowerCase().replaceAll('.', ',');
+const val = async (p) => (await get(ref(rtdb, p))).val();
+
+// מצב ההרשאה של המשתמש המחובר: { admin, status: 'approved' | 'blocked' | 'pending' | 'open' }
+export async function myAccess() {
+  const u = auth.currentUser;
+  const email = (u?.email || '').toLowerCase();
+  let admin = false;
+  if (u?.emailVerified && email) {
+    admin = email === SUPER_ADMIN || !!(await val(`admins/${emailKey(email)}`).catch(() => null));
+  }
+  const [access, config] = await Promise.all([val(`access/${u.uid}`).catch(() => null), val('config').catch(() => null)]);
+  const requireApproval = config?.requireApproval === true;
+  let status = access === 'blocked' ? 'blocked' : access === 'approved' ? 'approved' : requireApproval ? 'pending' : 'open';
+  if (admin && status !== 'blocked') status = 'approved';
+  return { admin, status, requireApproval, emailVerified: !!u?.emailVerified };
+}
+export const sendVerification = () => sendEmailVerification(auth.currentUser);
+export const reloadUser = async () => {
+  await auth.currentUser?.reload();
+  await auth.currentUser?.getIdToken(true);
+  return auth.currentUser;
+};
+
+export async function updateUserIndex(info) {
+  const u = auth.currentUser;
+  if (!u) return;
+  await update(ref(rtdb, `userIndex/${u.uid}`), {
+    email: u.email || '', name: u.displayName || '', lastSeen: Date.now(),
+    createdAt: Date.parse(u.metadata?.creationTime || '') || Date.now(), ...info,
+  });
+}
+export async function adminData() {
+  const [users, access, admins, config] = await Promise.all([val('userIndex'), val('access'), val('admins'), val('config')]);
+  return { users: users || {}, access: access || {}, admins: admins || {}, config: config || {} };
+}
+export const setAccess = (userId, status) => (status ? set(ref(rtdb, `access/${userId}`), status) : remove(ref(rtdb, `access/${userId}`)));
+export const setRequireApproval = (on) => set(ref(rtdb, 'config/requireApproval'), !!on);
+export const addAdmin = (email) => set(ref(rtdb, `admins/${emailKey(email)}`), { email: email.toLowerCase(), addedBy: auth.currentUser.email, at: Date.now() });
+export const removeAdmin = (email) => remove(ref(rtdb, `admins/${emailKey(email)}`));
 
 export function stopSync() {
   listeners.splice(0).forEach((r) => off(r));

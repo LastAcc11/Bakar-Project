@@ -41,11 +41,31 @@ function photosFor(photos, used, match) {
   return list;
 }
 
-function sectionBlocks(sec, photos, used, { blankLines }) {
+// הגדרות הדפסה (לכל דוח): הסתרת שורות שלא סומנו / סעיפים שלא סומנו בכלל
+function printRows(sec, opts) {
+  let rows = sec.rows.filter((r) => !r.hidden);
+  if (opts.hideUnmarked) {
+    const keep = (r) => r.status || (r.note || '').trim();
+    // כותרת קבוצה נשארת רק אם יש מתחתיה שורה שנשארת
+    rows = rows.filter((r, i) => {
+      if (!r.header) return keep(r);
+      for (let j = i + 1; j < rows.length && !rows[j].header; j++) if (keep(rows[j])) return true;
+      return false;
+    });
+  }
+  return rows;
+}
+export function sectionIsEmpty(sec, photos) {
+  return !sec.rows.some((r) => !r.hidden && !r.header && (r.status || (r.note || '').trim()))
+    && !(sec.text || '').trim()
+    && !photos.some((p) => p.ref === sec.key || (p.ref || '').startsWith(`${sec.key}:`));
+}
+
+function sectionBlocks(sec, photos, used, { blankLines, num, opts }) {
   const out = [];
-  const rows = sec.rows.filter((r) => !r.hidden);
+  const rows = printRows(sec, opts);
   if (sec.group) out.push({ t: 'h', num: '', text: sec.group });
-  if (sec.num) out.push({ t: 'h', num: sec.num, text: sec.title, ref: sec.ref });
+  if (num) out.push({ t: 'h', num, text: sec.title, ref: sec.ref });
   else out.push({ t: 'sub', text: `${sec.title}:` });
   if (rows.length) {
     out.push({
@@ -54,7 +74,7 @@ function sectionBlocks(sec, photos, used, { blankLines }) {
     });
   }
   const notes = compileNotes(sec);
-  if (notes || blankLines) out.push({ t: 'text', label: sec.textLabel, value: notes });
+  if (notes || (blankLines && !opts.hideEmptySections)) out.push({ t: 'text', label: sec.textLabel, value: notes });
   const pics = photosFor(photos, used, (ref) => ref === sec.key || ref.startsWith(`${sec.key}:`));
   if (pics.length) out.push({ t: 'photos', inline: true, label: 'תמונות לסעיף', items: pics });
   return out;
@@ -69,6 +89,8 @@ export function buildModel(report, site, settings) {
   const used = new Set();
   const blocks = [];
   const title = report.type === 'custom' ? d.formTitle || 'דו"ח' : T.title;
+  const opts = { hideUnmarked: !!report.print?.hideUnmarked, hideEmptySections: !!report.print?.hideEmptySections };
+  const visibleSecs = (list) => (opts.hideEmptySections ? list.filter((sec) => !sectionIsEmpty(sec, photos)) : list);
 
   blocks.push({
     t: 'meta',
@@ -99,13 +121,16 @@ export function buildModel(report, site, settings) {
     const [docs, checks, ...rest] = d.sections;
     blocks.push({ t: 'h', num: '1', text: '(א) נתונים כללי:' });
     blocks.push({ t: 'fields', rows: general });
-    for (const sec of [docs, checks].filter(Boolean)) blocks.push(...sectionBlocks(sec, photos, used, { blankLines: false }));
+    const pre = visibleSecs([docs, checks].filter(Boolean));
+    // כותרת "(ב) שלב טרום תחילת עבודה" שייכת לסעיף הראשון; אם הוא הוסתר — עוברת לבא אחריו
+    if (pre.length && !pre[0].group && docs?.group) pre[0] = { ...pre[0], group: docs.group };
+    for (const sec of pre) blocks.push(...sectionBlocks(sec, photos, used, { blankLines: false, opts }));
 
     blocks.push({ t: 'h', num: '2', text: 'הגדרת הביקור', ref: "[בהתאם לדרישות סעיף 2א'(ב)(1) לתקנה]" });
     blocks.push({ t: 'sub', text: 'סיבת הביקור:' });
     blocks.push({ t: 'checklist', items: VISIT_REASONS.map((r) => ({ label: r.label, level: 0, checked: d.reasons.includes(r.id) })) });
 
-    for (const sec of rest) blocks.push(...sectionBlocks(sec, photos, used, { blankLines: true }));
+    visibleSecs(rest).forEach((sec, i) => blocks.push(...sectionBlocks(sec, photos, used, { blankLines: true, num: String(i + 3), opts })));
 
     blocks.push({ t: 'declaration', text: DECLARATION });
     const summary = d.summary ?? settings.defaultSummary ?? DEFAULT_SUMMARY;
@@ -113,7 +138,7 @@ export function buildModel(report, site, settings) {
   } else if (report.type === 'custom') {
     blocks.push({ t: 'h', num: '1', text: 'נתונים כללי:' });
     blocks.push({ t: 'fields', rows: general });
-    for (const sec of d.sections) blocks.push(...sectionBlocks(sec, photos, used, { blankLines: false }));
+    visibleSecs(d.sections).forEach((sec, i) => blocks.push(...sectionBlocks(sec, photos, used, { blankLines: false, num: String(i + 2), opts })));
     if ((d.summary || '').trim()) blocks.push({ t: 'text', label: d.summaryLabel || 'סיכום והערות', value: d.summary });
   } else {
     blocks.push({ t: 'h', num: '1', text: 'נתונים כללי:' });
@@ -121,12 +146,15 @@ export function buildModel(report, site, settings) {
     const res = finalRisk(d);
     if (d.showMatrix !== false) blocks.push({ t: 'matrix', sev: d.severity, lik: d.likelihood, result: res });
     else if (res) blocks.push({ t: 'text', label: 'דירוג הסיכון', value: `${LEVEL_INFO[res.level].label}${res.score && !res.manual ? ` (ציון ${res.score})` : ''}` });
-    blocks.push({ t: 'text', label: 'פירוט הסיכון הבלתי קביל שנמצא', value: d.riskText });
+    const text = (label, value) => {
+      if ((value || '').trim() || !opts.hideEmptySections) blocks.push({ t: 'text', label, value });
+    };
+    text('פירוט הסיכון הבלתי קביל שנמצא', d.riskText);
     const pics = photosFor(photos, used, (ref) => ref === 'risk');
     if (pics.length) blocks.push({ t: 'photos', inline: true, label: 'תמונות הסיכון', items: pics });
-    blocks.push({ t: 'text', label: 'המענה הנדרש למימוש', value: d.requiredResponse });
-    blocks.push({ t: 'text', label: 'פעולות מתקנות מיידיות שבוצעו', value: d.correctiveActions });
-    blocks.push({ t: 'text', label: 'ממצאים/ליקויים נוספים לדיווח', value: d.otherFindings });
+    text('המענה הנדרש למימוש', d.requiredResponse);
+    text('פעולות מתקנות מיידיות שבוצעו', d.correctiveActions);
+    text('ממצאים/ליקויים נוספים לדיווח', d.otherFindings);
   }
 
   blocks.push({

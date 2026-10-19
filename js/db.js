@@ -1,8 +1,8 @@
 // אחסון מקומי בדפדפן (IndexedDB). משמש כעותק מקומי של הנתונים מהענן — כך האפליקציה נפתחת מיד
 // ועובדת גם בלי קליטה באתר. לכל משתמש מסד נפרד, כך שמשתמשים שונים על אותו מכשיר לא מתערבבים.
 const LEGACY_DB = 'bakar';
-const DB_VERSION = 1;
-const STORES = ['sites', 'reports', 'kv'];
+const DB_VERSION = 2;
+const STORES = ['sites', 'reports', 'kv', 'files'];
 
 let dbName = LEGACY_DB;
 let dbPromise;
@@ -89,6 +89,7 @@ export async function exportBackup() {
     sites: await db.all('sites'),
     reports: await db.all('reports'),
     kv: await db.all('kv'),
+    files: await db.all('files'),
   };
 }
 

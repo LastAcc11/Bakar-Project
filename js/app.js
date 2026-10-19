@@ -14,9 +14,9 @@ import { SignaturePad } from './signature.js';
 // ---------------- state ----------------
 // עבודה "מקומית קודם": כל שמירה נכתבת מיד למכשיר (IndexedDB) ובמקביל נשלחת לענן (Firebase).
 // שינויים שמגיעים מהענן (ממכשיר אחר) ממוזגים לפי זמן העדכון האחרון.
-const state = { settings: null, sites: [], reports: [], user: undefined, online: navigator.onLine };
+const state = { settings: null, sites: [], reports: [], user: undefined, online: navigator.onLine, access: { admin: false, status: 'open' } };
 // מצב תצוגה זמני (לא נשמר)
-const ui = { editList: null, openNotes: new Set(), askSent: null, reportsMode: 'all', addRecipient: false };
+const ui = { editList: null, openNotes: new Set(), askSent: null, reportsMode: 'all', addRecipient: false, admin: null };
 const $view = document.getElementById('view');
 const today = () => new Date().toISOString().slice(0, 10);
 const DAY = 86400000;
@@ -33,6 +33,7 @@ const DEFAULT_SETTINGS = {
   lastRecipients: { visit: [], risk: [], custom: [] },
   templates: {}, // רשימות בדיקה מותאמות לדוח ביקור, לפי מפתח סעיף
   customForms: [],
+  printDefaults: { hideUnmarked: false, hideEmptySections: false }, // נזכר מהבחירה האחרונה
   updatedAt: 0,
 };
 
@@ -48,6 +49,7 @@ function normalizeSettings(saved) {
     lastRecipients: { visit: arr(last.visit), risk: arr(last.risk), custom: arr(last.custom) },
     templates: s.templates || {},
     customForms: arr(s.customForms).map((f) => ({ ...f, sections: arr(f.sections).map((x) => ({ ...x, labels: { ...x.labels } })) })),
+    printDefaults: { ...DEFAULT_SETTINGS.printDefaults, ...s.printDefaults },
   };
 }
 
@@ -122,13 +124,15 @@ async function saveSite(s) {
   if (!state.sites.includes(s)) state.sites.push(s);
   await db.put('sites', s);
   toCloud(pushSiteNow(s));
+  reportUsage();
 }
-async function saveReport(r) {
-  r.updatedAt = Date.now();
+async function saveReport(r, { keepTime = false } = {}) {
+  if (!keepTime) r.updatedAt = Date.now();
   delete r._draft;
   if (!state.reports.includes(r)) state.reports.push(r);
   await db.put('reports', r);
   toCloud(pushReportNow(r));
+  reportUsage();
 }
 // ייבוא נתונים (משחזור גיבוי או מהגרסה המקומית הישנה) — נשמרים במכשיר ונשלחים לענן
 async function importData(data) {
@@ -144,6 +148,10 @@ async function importData(data) {
     if (i >= 0) state.reports[i] = item;
     await saveReport(item);
   }
+  for (const f of data.files || []) {
+    await db.put('files', f);
+    if (cloud.isSyncing()) toCloud(cloud.pushFile(f.id, f.data));
+  }
   const settings = (data.kv || []).find((k) => k.key === 'settings')?.value;
   if (settings) {
     state.settings = normalizeSettings(settings);
@@ -154,6 +162,7 @@ async function importData(data) {
 async function deleteReport(r) {
   state.reports = state.reports.filter((x) => x.id !== r.id);
   if (r._draft) return;
+  if (r.shareToken && cloud.isSyncing()) toCloud(cloud.removeShared(r.shareToken));
   await db.del('reports', r.id);
   toCloud(cloud.removeReport(r));
 }
@@ -344,9 +353,11 @@ function siteStats(s) {
   const risks = reps.filter((r) => r.type === 'risk');
   const stages = new Set(visits.flatMap((v) => v.data.reasons || []));
   const last = visits.map((v) => v.visitDate).sort().pop() || null;
-  const due = last ? addDays(last, MAX_DAYS_BETWEEN_VISITS) : null;
+  // תדירות שסוכמה עם המזמין (אם הוגדרה) — אבל לא יותר מ-3 חודשים לפי החוק
+  const interval = Math.min(MAX_DAYS_BETWEEN_VISITS, parseInt(s.internal?.frequencyDays, 10) || MAX_DAYS_BETWEEN_VISITS);
+  const due = last ? addDays(last, interval) : null;
   const left = due ? daysBetween(today(), due) : null;
-  return { reps, visits, risks, stages, last, due, left };
+  return { reps, visits, risks, stages, last, due, left, interval };
 }
 
 function dueChip(st) {
@@ -487,6 +498,42 @@ function newReportButtons(s) {
     ${state.settings.customForms.length ? `<div class="form-chips">${state.settings.customForms.map((f) => `<button class="chip-btn" data-action="new-report" data-type="custom" data-form="${f.id}" data-site="${s.id}">☑ ${esc(f.name)}</button>`).join('')}</div>` : ''}`;
 }
 
+// לשונית "כללי" פנימית לאתר — לא מודפסת בדוחות (רמת בקרה שסוכמה, הערות, חוזה בקר)
+const CONTROL_LEVELS = [
+  'בקרה מינימלית — לפי הנדרש בחוק',
+  'בקרה מוגברת — מעבר לנדרש בחוק, לפי תיאום',
+  'בקרה מקסימלית — ביקורים תכופים',
+];
+function fileSize(n) {
+  return n > 1048576 ? `${(n / 1048576).toFixed(1)}MB` : `${Math.max(1, Math.round(n / 1024))}KB`;
+}
+function siteInternal(s) {
+  const it = s.internal || {};
+  const custom = it.controlLevel && !CONTROL_LEVELS.includes(it.controlLevel);
+  const files = arr(s.files);
+  return `<section class="panel internal" data-site-id="${s.id}">
+    <h2 class="panel-h">🔒 כללי — פנימי <small>לא מודפס בדוחות</small></h2>
+    <div class="grid2">
+      <label class="field"><span>רמת הבקרה שסוכמה עם המזמין</span>
+        <select data-sbind="internal.controlLevel" data-rerender-site="1">
+          <option value="" ${!it.controlLevel ? 'selected' : ''}>— לא הוגדר —</option>
+          ${CONTROL_LEVELS.map((l) => `<option ${it.controlLevel === l ? 'selected' : ''}>${esc(l)}</option>`).join('')}
+          <option value="__custom" ${custom ? 'selected' : ''}>אחר…</option>
+        </select></label>
+      <label class="field"><span>תדירות ביקורים מוסכמת (ימים) <small class="muted">— התזכורת תתאים את עצמה</small></span>
+        <input data-sbind="internal.frequencyDays" value="${esc(it.frequencyDays || '')}" inputmode="numeric" placeholder="למשל 30"></label>
+    </div>
+    ${custom || it.controlLevel === '__custom' ? `<label class="field"><span>תיאור רמת הבקרה</span><input data-sbind="internal.controlLevelText" value="${esc(it.controlLevelText || (custom ? it.controlLevel : ''))}"></label>` : ''}
+    <label class="field"><span>הערות פנימיות</span><textarea data-sbind="internal.notes" rows="4" placeholder="סיכומים עם המזמין, תנאים מיוחדים, שכר טרחה…">${esc(it.notes || '')}</textarea></label>
+    <div class="field"><span>קבצים מצורפים לאתר <small class="muted">(חוזה בקר, תוכנית בטיחות… עד 8MB לקובץ)</small></span>
+      ${files.length ? files.map((f) => `<div class="file-row"><span class="file-ico">📄</span><span class="row-main"><b>${esc(f.name)}</b><small>${fileSize(f.size)} · ${formatDate(new Date(f.at).toISOString())}</small></span>
+        <button class="btn small" data-action="file-open" data-site="${s.id}" data-id="${f.id}">פתח</button>
+        <button class="icon-btn2" data-action="file-remove" data-site="${s.id}" data-id="${f.id}" aria-label="מחק">✕</button></div>`).join('') : '<p class="muted tiny">אין קבצים</p>'}
+      <button class="btn small" data-action="file-add" data-site="${s.id}">📎 צרף קובץ</button>
+    </div>
+  </section>`;
+}
+
 function viewSite(id) {
   const s = site(id);
   if (!s) return notFound();
@@ -499,6 +546,7 @@ function viewSite(id) {
     ${newReportButtons(s)}
   </section>
   <section class="panel" data-site-id="${s.id}"><h2 class="panel-h">פרטי האתר ואנשי קשר <small class="saved" id="saved"></small></h2>${siteForm(s)}</section>
+  ${siteInternal(s)}
   <section class="panel"><h2 class="panel-h">דוחות <small>${reps.length}</small></h2>${reps.length ? reps.map((r) => reportRow(r)).join('') : '<p class="empty">אין דוחות לאתר זה</p>'}</section>
   <button class="btn ghost danger-text" data-action="delete-site" data-site="${s.id}">מחק אתר</button>`;
 }
@@ -556,6 +604,7 @@ function getSteps(r) {
   return [{ id: 'details', name: 'פרטים' }, ...r.data.sections.map((s) => ({ id: 'sec', keys: [s.key], name: short(s.title || 'סעיף') })),
     { id: 'sign', name: 'סיכום וחתימה' }, { id: 'photos', name: 'תמונות' }];
 }
+const STATUS_LABEL_NAMES = { ok: 'חיובי', bad: 'שלילי', na: 'שלישי' };
 const secIndex = (r, key) => r.data.sections.findIndex((s) => s.key === key);
 const activeRows = (sec) => sec.rows.filter((x) => !x.hidden && !x.header);
 
@@ -632,7 +681,16 @@ function sectionEditor(r, si, { showTitle }) {
         <button class="btn small ${editing ? 'primary' : ''}" data-action="edit-list" data-key="${sec.key}">${editing ? '✓ סיום עריכה' : `✎ ערוך רשימה${hiddenN ? ` (${hiddenN} הוסרו)` : ''}`}</button>
       </span>
     </div>
-    ${editing ? `<p class="muted tiny">שנה נוסח, הסר שורות שלא רלוונטיות או הוסף שורות. השינוי חל על הדוח הזה בלבד. את רשימת ברירת המחדל לדוחות הבאים קובעים ב<a class="link" href="#/settings">הגדרות</a>.</p>` : ''}
+    ${editing ? `<p class="muted tiny">שנה את נוסח הסעיף והשורות, הסר שורות שלא רלוונטיות או הוסף שורות. השינוי חל על הדוח הזה בלבד. את רשימת ברירת המחדל לדוחות הבאים קובעים ב<a class="link" href="#/settings">הגדרות</a>.</p>
+    <div class="sec-edit">
+      <label class="field"><span>נוסח כותרת הסעיף</span><textarea data-bind="data.sections.${si}.title" rows="2">${esc(sec.title)}</textarea></label>
+      ${sec.ref !== undefined ? `<label class="field"><span>הפניה לתקנה</span><input data-bind="data.sections.${si}.ref" value="${esc(sec.ref || '')}"></label>` : ''}
+      <div class="grid2">
+        <label class="field"><span>כותרת עמודת הפריטים</span><input data-bind="data.sections.${si}.head" value="${esc(sec.head || '')}"></label>
+        <label class="field"><span>כותרת שדה הפירוט</span><input data-bind="data.sections.${si}.textLabel" value="${esc(sec.textLabel || '')}"></label>
+      </div>
+      <div class="grid3">${['ok', 'bad', 'na'].map((k) => `<label class="field"><span>סימון "${esc(STATUS_LABEL_NAMES[k])}"</span><input data-bind="data.sections.${si}.labels.${k}" value="${esc(sec.labels[k])}"></label>`).join('')}</div>
+    </div>` : ''}
     <div class="tri-list" role="list">
       ${sec.rows.map((x, j) => (editing ? editRow(si, j, x) : x.hidden ? '' : x.header ? `<div class="tri-group">${esc(x.label)}</div>` : triRow(r, si, j, x, sec))).join('')}
     </div>
@@ -847,9 +905,9 @@ const ownRecipients = (r) => {
   if (!r.recipients?.length) r.recipients = defaultRecipients(r);
   return r.recipients;
 };
-function shareMessage(r, name) {
+function shareMessage(r, name, link) {
   const s = site(r.siteId) || {};
-  return `שלום${name ? ` ${name}` : ''},\nמצורף ${reportTitle(r)}${r.number ? ` מס' ${r.number}` : ''} – ${s.name || ''} מתאריך ${formatDate(r.visitDate)}.\n\n${state.settings.inspector.name || ''}${state.settings.company.name ? `\n${state.settings.company.name}` : ''}`;
+  return `שלום${name ? ` ${name}` : ''},\n${link ? 'להלן' : 'מצורף'} ${reportTitle(r)}${r.number ? ` מס' ${r.number}` : ''} – ${s.name || ''} מתאריך ${formatDate(r.visitDate)}.${link ? `\n\nלצפייה והורדת הדוח (PDF):\n${link}` : ''}\n\n${state.settings.inspector.name || ''}${state.settings.company.name ? `\n${state.settings.company.name}` : ''}`;
 }
 async function rememberRecipients(r) {
   const extras = ownRecipients(r).filter((x) => x.src === 'extra' || x.src === 'added').map(({ name, role, phone, email }) => ({ name, role, phone, email }));
@@ -871,7 +929,7 @@ function viewPreview(r) {
     ${dl ? `<span class="chip ${dl.kind}">${dl.label}</span>` : r.status === 'sent' ? '<span class="chip ok">הופץ</span>' : ''}
     <a class="btn small" href="#/r/${r.id}/0">✎ עריכת הדוח</a></div>
   <div class="preview-layout">
-    <aside class="preview-side">
+    <aside class="preview-side" data-report-id="${r.id}">
       <div class="panel">
         <div class="export-btns">
           <button class="btn primary" data-action="export-pdf">⬇ PDF</button>
@@ -879,6 +937,12 @@ function viewPreview(r) {
           <button class="btn" data-action="share">↗ שיתוף קובץ</button>
           <button class="btn" data-action="print">⎙ הדפסה</button>
         </div>
+      </div>
+      <div class="panel">
+        <h2 class="panel-h">הגדרות הדפסה</h2>
+        <label class="check"><input type="checkbox" data-bind="print.hideUnmarked" data-rerender="1" data-print-default="hideUnmarked" ${r.print?.hideUnmarked ? 'checked' : ''}><span>הסתר שורות שלא סומנו</span></label>
+        <label class="check"><input type="checkbox" data-bind="print.hideEmptySections" data-rerender="1" data-print-default="hideEmptySections" ${r.print?.hideEmptySections ? 'checked' : ''}><span>הסתר סעיפים ופרקים שלא מולאו כלל (וקווי מילוי ריקים)</span></label>
+        <p class="muted tiny">חל על התצוגה, ה-PDF, ה-Word וההדפסה. הבחירה נזכרת לדוחות הבאים.</p>
       </div>
       ${issues.length ? `<div class="panel issues"><h2 class="panel-h">לפני הפצה <small>${issues.length}</small></h2><ul>${issues.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '<div class="panel ok-panel">✓ הדוח מלא ומוכן להפצה</div>'}
       <div class="panel dist">
@@ -899,10 +963,12 @@ function viewPreview(r) {
           <div class="row-btns"><button class="btn small primary">הוסף</button><button class="btn small ghost" type="button" data-action="recip-add-toggle">ביטול</button></div>
         </form>` : '<button class="link-btn" data-action="recip-add-toggle">+ הוסף נמען</button>'}
         <div class="row-btns">
-          <button class="btn small" data-action="send-gmail-all" ${on.some((x) => x.email) ? '' : 'disabled'}>Gmail לכל הנבחרים</button>
-          <button class="btn small" data-action="send-mail-all" ${on.some((x) => x.email) ? '' : 'disabled'}>✉ אפליקציית מייל</button>
+          <button class="btn small" data-action="send-gmail-all" ${on.some((x) => x.email) ? '' : 'disabled'}>${isMobile() ? '✉ מייל לכל הנבחרים' : 'Gmail לכל הנבחרים'}</button>
+          ${isMobile() ? '' : `<button class="btn small" data-action="send-mail-all" ${on.some((x) => x.email) ? '' : 'disabled'}>✉ אפליקציית מייל</button>`}
+          <button class="btn small" data-action="copy-link">🔗 העתק קישור לדוח</button>
         </div>
-        <p class="muted tiny">${isMobile() ? 'בטלפון: לחיצה על "וואטסאפ" פותחת את חלון השיתוף עם קובץ ה-PDF — בחר וואטסאפ ואת איש הקשר.' : 'במחשב: ה-PDF יורד אוטומטית ונפתחת הודעה מוכנה — גרור את הקובץ להודעה.'} נמענים קבועים נקבעים ב<a class="link" href="#/settings">הגדרות</a>; אם לא הוגדרו, נזכרים הנמענים האחרונים.</p>
+        <p class="muted tiny">וואטסאפ ומייל נפתחים ישר מול הנמען, עם הודעה מוכנה ו<b>קישור לדוח</b>. הנמען לוחץ על הקישור ופותח או מוריד את ה-PDF, גם בלי חשבון. ${r.shareToken ? `<a class="link" href="#/v/${r.shareToken}" target="_blank">פתח את הקישור</a>` : ''}
+        לשליחת הקובץ עצמו כצרופה, השתמש ב"שיתוף קובץ". נמענים קבועים נקבעים ב<a class="link" href="#/settings">הגדרות</a>.</p>
         ${ui.askSent === r.id && r.status !== 'sent' ? '<div class="ask-sent">שלחת את הדוח? סמן אותו כהופץ כדי להוריד אותו מרשימת הממתינים.</div>' : ''}
         <button class="btn ${r.status === 'sent' ? '' : 'primary'} full" data-action="mark-sent">${r.status === 'sent' ? '↺ החזר לטיוטה' : '✓ סמן כהופץ'}</button>
         <p class="muted tiny">"הופץ" רק מסמן שהדוח נשלח: הוא יוצא מרשימת "ממתינים להפצה" ומתזכורות המועד, ונשמר תאריך ההפצה. אפשר להמשיך לערוך גם אחרי זה.</p>
@@ -944,6 +1010,9 @@ function viewSettings() {
   const ins = st.inspector;
   return `
   <div class="page-h"><a class="back" href="#/">→</a><h1>הגדרות</h1><small class="saved" id="saved"></small></div>
+  ${state.access.admin ? '<a class="banner admin-banner" href="#/admin">🛡 ניהול מערכת — משתמשים, שימוש והרשאות ←</a>' : ''}
+  ${!state.access.admin && (state.user.email || '').toLowerCase() === cloud.SUPER_ADMIN && !state.user.emailVerified ? `<div class="banner">כדי לקבל הרשאות מנהל צריך לאמת את כתובת המייל (או להתחבר עם Google).
+    <div class="row-btns"><button class="btn small primary" data-action="verify-email">שלח מייל אימות</button><button class="btn small" data-action="access-recheck">בדוק שוב</button></div></div>` : ''}
   <section class="panel">
     <h2 class="panel-h">פרופיל הבקר <small>ייכנס אוטומטית לכל דוח חדש</small></h2>
     <div class="grid2">
@@ -1061,6 +1130,133 @@ function viewForm(id) {
   </div>`;
 }
 
+// ---------- ניהול מערכת (סעיפים 5–6) ----------
+const fmtDay = (ms) => (ms ? formatDate(new Date(ms).toISOString()) : '—');
+async function loadAdmin() {
+  try {
+    ui.admin = await cloud.adminData();
+  } catch (err) {
+    console.error(err);
+    ui.admin = { error: true };
+  }
+  if (current.route === 'admin') rerender();
+}
+
+function viewAdmin() {
+  if (!state.access.admin) return notFound();
+  if (!ui.admin) {
+    loadAdmin();
+    return '<div class="page-h"><a class="back" href="#/settings">→</a><h1>ניהול מערכת</h1></div><section class="panel"><p class="empty">טוען…</p></section>';
+  }
+  if (ui.admin.error) {
+    return `<div class="page-h"><a class="back" href="#/settings">→</a><h1>ניהול מערכת</h1></div>
+      <section class="panel issues"><p>אין הרשאה לקרוא את נתוני הניהול. ודא שכללי ה-Database עודכנו (database.rules.json) ושהתחברת עם Google או אימתת את המייל.</p>
+      <button class="btn" data-action="admin-refresh">נסה שוב</button></section>`;
+  }
+  const { users, access, admins, config } = ui.admin;
+  const list = Object.entries(users).map(([id, u]) => ({ id, ...u, st: u.stats || {}, acc: access[id] || '' }))
+    .sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+  const totalBytes = list.reduce((a, u) => a + (u.st.bytes || 0), 0);
+  const pct = Math.min(100, (totalBytes / 1073741824) * 100);
+  const req = config.requireApproval === true;
+  const statusChip = (u) => {
+    const isAdm = u.email && (u.email.toLowerCase() === cloud.SUPER_ADMIN || admins[cloud.emailKey(u.email)]);
+    if (u.acc === 'blocked') return '<span class="chip danger">חסום</span>';
+    if (isAdm) return '<span class="chip ok">מנהל</span>';
+    if (u.acc === 'approved') return '<span class="chip ok">מאושר</span>';
+    return req ? '<span class="chip warn">ממתין לאישור</span>' : '<span class="chip">פעיל</span>';
+  };
+  const pending = list.filter((u) => !u.acc).length;
+  return `
+  <div class="page-h"><a class="back" href="#/settings">→</a><h1>ניהול מערכת</h1><button class="btn small" data-action="admin-refresh">↻ רענן</button></div>
+  <section class="panel">
+    <div class="stats">
+      <div><b>${list.length}</b><small>משתמשים</small></div>
+      <div><b>${list.filter((u) => Date.now() - (u.lastSeen || 0) < 30 * DAY).length}</b><small>פעילים ב-30 יום</small></div>
+      <div><b>${list.reduce((a, u) => a + (u.st.reports || 0), 0)}</b><small>דוחות</small></div>
+      <div><b>${fileSize(totalBytes)}</b><small>מתוך 1GB חינם</small></div>
+    </div>
+    <div class="meter"><span style="width:${pct.toFixed(1)}%"></span></div>
+  </section>
+  <section class="panel">
+    <h2 class="panel-h">הרשאות שימוש</h2>
+    <label class="check"><input type="checkbox" data-action="admin-approval" ${req ? 'checked' : ''}><span><b>משתמשים חדשים צריכים אישור מנהל</b> — עד שתאשר, הם יראו מסך "ממתין לאישור" ולא יוכלו לשמור.</span></label>
+    ${req && pending ? `<button class="btn small" data-action="approve-all">אשר את כל ${pending} הממתינים</button>` : ''}
+  </section>
+  <section class="panel">
+    <h2 class="panel-h">משתמשים <small>${list.length}</small></h2>
+    <div class="users">
+      ${list.map((u) => `<div class="user">
+        <div class="user-main"><b>${esc(u.name || u.email || u.id)}</b><small dir="ltr">${esc(u.email || '')}</small></div>
+        ${statusChip(u)}
+        <div class="user-stats">
+          <span>הצטרף <b>${fmtDay(u.createdAt)}</b></span><span>כניסה אחרונה <b>${fmtDay(u.lastSeen)}</b></span>
+          <span>אתרים <b>${u.st.sites ?? 0}</b></span><span>דוחות <b>${u.st.reports ?? 0}</b> (החודש ${u.st.reportsMonth ?? 0})</span>
+          <span>תמונות <b>${u.st.photos ?? 0}</b></span><span>נפח <b>${fileSize(u.st.bytes || 0)}</b></span>
+        </div>
+        <div class="row-btns tight">
+          ${u.acc !== 'approved' && u.acc !== 'blocked' && req ? `<button class="btn small primary" data-action="admin-access" data-uid="${u.id}" data-status="approved">✓ אשר</button>` : ''}
+          ${u.acc === 'blocked'
+            ? `<button class="btn small" data-action="admin-access" data-uid="${u.id}" data-status="">בטל חסימה</button>`
+            : u.id !== state.user.uid ? `<button class="btn small danger" data-action="admin-access" data-uid="${u.id}" data-status="blocked">חסום</button>` : ''}
+        </div>
+      </div>`).join('') || '<p class="empty">אין עדיין משתמשים רשומים</p>'}
+    </div>
+    <p class="muted tiny">משתמש מופיע כאן מהכניסה הראשונה שלו אחרי העדכון. הנתונים מתעדכנים בכל פעם שהוא עובד באפליקציה. רשימה מלאה של כל החשבונות יש גם ב-<a class="link" href="https://console.firebase.google.com/project/bakar-project/authentication/users" target="_blank">Firebase → Authentication</a>.</p>
+  </section>
+  <section class="panel">
+    <h2 class="panel-h">מנהלים</h2>
+    <div class="file-row"><span class="row-main"><b dir="ltr">${cloud.SUPER_ADMIN}</b><small>מנהל ראשי (קבוע)</small></span></div>
+    ${Object.values(admins).map((a) => `<div class="file-row"><span class="row-main"><b dir="ltr">${esc(a.email)}</b><small>נוסף ע"י ${esc(a.addedBy || '')} · ${fmtDay(a.at)}</small></span>
+      <button class="icon-btn2" data-action="admin-remove" data-email="${esc(a.email)}" aria-label="הסר מנהל">✕</button></div>`).join('')}
+    <form class="inline-form" data-action="admin-add">
+      <input name="email" type="email" dir="ltr" placeholder="המייל של המנהל החדש" required>
+      <button class="btn primary">הפוך למנהל</button>
+    </form>
+    <p class="muted tiny">מנהל רואה את כל המשתמשים ואת השימוש שלהם, מאשר וחוסם משתמשים ומוסיף מנהלים. כדי שההרשאה תעבוד, המנהל צריך להתחבר עם Google, או לאמת את כתובת המייל שלו. מנהלים לא רואים את תוכן הדוחות של משתמשים אחרים.</p>
+  </section>`;
+}
+
+function viewGate() {
+  const blocked = state.access.status === 'blocked';
+  return `<section class="auth">
+    <div class="auth-brand"><span class="brand-mark">◆</span> בקר</div>
+    <h1>${blocked ? 'הגישה נחסמה' : 'ממתין לאישור'}</h1>
+    <p class="muted">${blocked ? 'החשבון שלך נחסם על ידי מנהל המערכת. לבירור פנה למנהל.' : 'החשבון נוצר בהצלחה. מנהל המערכת צריך לאשר אותו לפני שאפשר להתחיל לעבוד. נשלחה אליו הודעה ברשימת המשתמשים.'}</p>
+    <p class="muted tiny" dir="ltr">${esc(state.user.email || '')}</p>
+    ${blocked ? '' : '<button class="btn primary full" data-action="access-recheck">בדוק שוב</button>'}
+    <button class="btn ghost full" data-action="logout">התנתק</button>
+  </section>`;
+}
+
+// עמוד ציבורי לנמען: פתיחת הדוח מהקישור, בלי צורך בחשבון
+function viewShared(token) {
+  setTimeout(async () => {
+    const box = document.getElementById('shared');
+    let d = null;
+    try { d = await cloud.fetchShared(token); } catch (err) { console.error(err); }
+    if (!box) return;
+    if (!d?.pdf) {
+      box.innerHTML = '<p class="empty">הדוח לא נמצא. ייתכן שהקישור שגוי או שהדוח נמחק.</p>';
+      return;
+    }
+    const blob = await (await fetch(d.pdf)).blob();
+    const url = URL.createObjectURL(blob);
+    box.innerHTML = `
+      <div class="shared-head">
+        <span class="action-ico">▤</span>
+        <span><b>${esc(d.title)}</b><small>${esc(d.site)}${d.date ? ` · ${formatDate(d.date)}` : ''}</small>
+        ${d.company || d.inspector ? `<small>מאת: ${esc([d.inspector, d.company].filter(Boolean).join(' · '))}</small>` : ''}</span>
+      </div>
+      <div class="row-btns">
+        <a class="btn primary" href="${url}" download="${esc(d.filename || 'report.pdf')}">⬇ הורד PDF</a>
+        <a class="btn" href="${url}" target="_blank">פתח בחלון חדש</a>
+      </div>
+      ${isMobile() ? '' : `<iframe class="shared-frame" src="${url}" title="הדוח"></iframe>`}`;
+  });
+  return `<section class="panel shared" id="shared"><p class="empty">טוען את הדוח…</p></section>`;
+}
+
 function notFound() {
   return '<section class="panel"><p class="empty">לא נמצא. <a class="link" href="#/">חזרה לדף הבית</a></p></section>';
 }
@@ -1092,10 +1288,22 @@ function viewLogin() {
 }
 
 function render() {
+  const hashParts = location.hash.replace(/^#\/?/, '').split('/');
+  if (hashParts[0] === 'v' && hashParts[1]) {
+    document.body.classList.add('logged-out', 'viewer');
+    $view.innerHTML = viewShared(hashParts[1]);
+    return;
+  }
+  document.body.classList.remove('viewer');
   if (!state.user) {
     $view.innerHTML = state.user === undefined ? '<div class="splash"><span class="brand-mark">◆</span></div>' : viewLogin();
     document.body.classList.add('logged-out');
     updateSyncBadge();
+    return;
+  }
+  if (state.access.status === 'blocked' || state.access.status === 'pending') {
+    $view.innerHTML = viewGate();
+    document.body.classList.add('logged-out');
     return;
   }
   document.body.classList.remove('logged-out');
@@ -1111,10 +1319,11 @@ function render() {
     case 'r': html = viewReport(args[0], args[1]); break;
     case 'settings': html = viewSettings(); break;
     case 'forms': html = args[0] ? viewForm(args[0]) : viewForms(); break;
+    case 'admin': html = viewAdmin(); break;
     default: html = notFound();
   }
   $view.innerHTML = html;
-  const navRoute = route === 'new' ? 'new' : route === 'forms' ? 'settings' : route || 'home';
+  const navRoute = route === 'new' ? 'new' : ['forms', 'admin'].includes(route) ? 'settings' : route || 'home';
   document.querySelectorAll('.nav a').forEach((a) => a.classList.toggle('on', a.dataset.route === navRoute));
   if (route === 'r' && args[1] === 'preview') fitPaper();
   updateCrumb();
@@ -1129,7 +1338,7 @@ function rerender() {
 
 function updateCrumb() {
   const { route, args } = current;
-  const map = { '': '~', new: '~/חדש', sites: '~/אתרים', reports: '~/דוחות', settings: '~/הגדרות', forms: '~/טפסים', r: '~/דוח' };
+  const map = { '': '~', new: '~/חדש', sites: '~/אתרים', reports: '~/דוחות', settings: '~/הגדרות', forms: '~/טפסים', admin: '~/ניהול', r: '~/דוח' };
   let c = map[route] ?? '~';
   if (route === 'sites' && args[0]) c += `/${site(args[0])?.name || ''}`;
   if (route === 'r') {
@@ -1173,6 +1382,10 @@ document.addEventListener('input', (e) => {
     if (!r) return;
     setPath(r, el.dataset.bind, inputValue(el));
     persistReport(r);
+    if (el.dataset.printDefault) {
+      state.settings.printDefaults[el.dataset.printDefault] = inputValue(el);
+      persistSettings();
+    }
     if (el.dataset.rerender) {
       saveReport(r).then(rerender);
     } else if (el.type === 'checkbox' || el.tagName === 'SELECT') refreshSteps(r);
@@ -1182,7 +1395,8 @@ document.addEventListener('input', (e) => {
     const [role, field] = el.dataset.sbind.split('.');
     if (field && typeof s[role] !== 'object') s[role] = { name: s[role] || '' };
     setPath(s, el.dataset.sbind, el.value);
-    persistSite(s);
+    if (el.dataset.rerenderSite) saveSite(s).then(rerender);
+    else persistSite(s);
   } else if (el.dataset.setbind) {
     setPath(state.settings, el.dataset.setbind, inputValue(el));
     persistSettings();
@@ -1198,6 +1412,9 @@ document.addEventListener('change', (e) => {
   if ((el.dataset.bind || el.dataset.setbind) && el.tagName === 'SELECT') el.dispatchEvent(new Event('input', { bubbles: true }));
   if (el.dataset.action === 'recip-toggle') actions['recip-toggle'](el);
   if (el.dataset.action === 'toggle-cloud') actions['toggle-cloud'](el);
+  if (el.dataset.action === 'admin-approval') {
+    cloud.setRequireApproval(el.checked).then(loadAdmin).catch(() => toast('אין הרשאה', 'danger'));
+  }
 });
 
 function refreshSteps(r) {
@@ -1224,6 +1441,7 @@ function createReport(type, siteId, extra = {}, { save = false } = {}) {
     data: newReportData(type, { templates: state.settings.templates }), photos: [],
     inspector: { name: ins.name, title: ins.title, signature: ins.signature },
     createdAt: Date.now(), updatedAt: Date.now(),
+    print: { ...state.settings.printDefaults },
     ...extra,
   });
   r._draft = true;
@@ -1542,20 +1760,20 @@ const actions = {
   async 'send-wa'(el) {
     const r = report(current.args[0]);
     const x = recipients(r)[+el.dataset.i];
+    // פותחים את החלון מיד (בתוך הלחיצה), אחרת הדפדפן חוסם אותו אחרי ההמתנה להעלאה
+    const win = window.open('', '_blank');
     busy(el, true);
     try {
-      if (isMobile() && navigator.canShare) {
-        const res = await shareFile(r, shareMessage(r, x.name));
-        if (res === true) toast(`בחר וואטסאפ ואת ${x.name || 'איש הקשר'}`);
-        if (res === 'cancel') return;
-        if (res === false) window.open(`https://wa.me/${waNumber(x.phone)}?text=${encodeURIComponent(shareMessage(r, x.name))}`, '_blank');
-      } else {
-        const f = await makeFile(r, 'pdf');
-        download(f, f.name);
-        window.open(`https://wa.me/${waNumber(x.phone)}?text=${encodeURIComponent(shareMessage(r, x.name))}`, '_blank');
-        toast('ה-PDF הורד — צרף אותו לשיחה בוואטסאפ');
-      }
+      const link = await shareLink(r);
+      const url = `https://wa.me/${waNumber(x.phone)}?text=${encodeURIComponent(shareMessage(r, x.name, link))}`;
+      if (win) win.location.href = url;
+      else location.href = url;
+      if (!link) await fallbackFile(r);
       await rememberRecipients(r);
+    } catch (err) {
+      win?.close();
+      console.error(err);
+      toast('השליחה נכשלה', 'danger');
     } finally {
       busy(el, false);
       rerender();
@@ -1563,15 +1781,32 @@ const actions = {
   },
   async 'send-gmail'(el) {
     const r = report(current.args[0]);
-    await openMail(r, [recipients(r)[+el.dataset.i]], 'gmail', el);
+    await openMail(r, [recipients(r)[+el.dataset.i]], isMobile() ? 'mailto' : 'gmail', el);
   },
   async 'send-gmail-all'(el) {
     const r = report(current.args[0]);
-    await openMail(r, recipients(r).filter((x) => x.on), 'gmail', el);
+    await openMail(r, recipients(r).filter((x) => x.on), isMobile() ? 'mailto' : 'gmail', el);
   },
   async 'send-mail-all'(el) {
     const r = report(current.args[0]);
     await openMail(r, recipients(r).filter((x) => x.on), 'mailto', el);
+  },
+  async 'copy-link'(el) {
+    const r = report(current.args[0]);
+    busy(el, true);
+    try {
+      const link = await shareLink(r);
+      if (!link) return;
+      try {
+        await navigator.clipboard.writeText(link);
+        toast('הקישור לדוח הועתק ✓');
+      } catch {
+        prompt('העתק את הקישור:', link);
+      }
+    } finally {
+      busy(el, false);
+      rerender();
+    }
   },
   async 'mark-sent'() {
     const r = report(current.args[0]);
@@ -1629,6 +1864,92 @@ const actions = {
     state.settings.customForms.splice(+el.dataset.i, 1);
     await saveSettings();
     location.hash = '#/forms';
+  },
+  // ---- קבצים מצורפים לאתר ----
+  async 'file-add'(el) {
+    const s = site(el.dataset.site);
+    const inp = document.createElement('input');
+    inp.type = 'file';
+    inp.accept = '.pdf,.doc,.docx,.xls,.xlsx,image/*';
+    inp.onchange = async () => {
+      const f = inp.files[0];
+      if (!f) return;
+      if (f.size > 8 * 1048576) return toast('הקובץ גדול מ-8MB', 'danger');
+      const id = uid();
+      const data = await readFileAsDataURL(f);
+      await db.put('files', { id, data });
+      s.files = [...arr(s.files), { id, name: f.name, type: f.type, size: f.size, at: Date.now() }];
+      await saveSite(s);
+      if (cloud.isSyncing()) toCloud(cloud.pushFile(id, data));
+      toast('הקובץ צורף לאתר ✓');
+      rerender();
+    };
+    inp.click();
+  },
+  async 'file-open'(el) {
+    const meta = arr(site(el.dataset.site).files).find((f) => f.id === el.dataset.id);
+    busy(el, true);
+    try {
+      let row = await db.get('files', el.dataset.id);
+      if (!row) {
+        const data = await cloud.fetchFile(el.dataset.id);
+        if (!data) return toast('הקובץ לא נמצא במכשיר או בענן', 'danger');
+        row = { id: el.dataset.id, data };
+        await db.put('files', row);
+      }
+      download(await (await fetch(row.data)).blob(), meta?.name || 'file');
+    } finally {
+      busy(el, false);
+    }
+  },
+  async 'file-remove'(el) {
+    if (!confirm('למחוק את הקובץ?')) return;
+    const s = site(el.dataset.site);
+    s.files = arr(s.files).filter((f) => f.id !== el.dataset.id);
+    await saveSite(s);
+    await db.del('files', el.dataset.id);
+    if (cloud.isSyncing()) toCloud(cloud.removeFile(el.dataset.id));
+    rerender();
+  },
+  // ---- ניהול ----
+  async 'admin-refresh'() {
+    ui.admin = null;
+    await loadAdmin();
+  },
+  async 'admin-access'(el) {
+    await cloud.setAccess(el.dataset.uid, el.dataset.status || null);
+    toast(el.dataset.status === 'blocked' ? 'המשתמש נחסם' : el.dataset.status === 'approved' ? 'המשתמש אושר ✓' : 'עודכן');
+    await loadAdmin();
+  },
+  async 'approve-all'() {
+    const ids = Object.keys(ui.admin.users).filter((id) => !ui.admin.access[id]);
+    for (const id of ids) await cloud.setAccess(id, 'approved');
+    toast(`אושרו ${ids.length} משתמשים`);
+    await loadAdmin();
+  },
+  async 'admin-remove'(el) {
+    if (!confirm(`להסיר את ${el.dataset.email} מהמנהלים?`)) return;
+    await cloud.removeAdmin(el.dataset.email);
+    await loadAdmin();
+  },
+  async 'verify-email'(el) {
+    busy(el, true);
+    try {
+      await cloud.sendVerification();
+      toast('נשלח מייל אימות. אחרי האישור לחץ "בדוק שוב"');
+    } catch (err) {
+      toast(cloud.authError(err), 'danger');
+    } finally {
+      busy(el, false);
+    }
+  },
+  async 'access-recheck'(el) {
+    busy(el, true);
+    await cloud.reloadUser().catch(() => {});
+    await checkAccess();
+    busy(el, false);
+    if (!['blocked', 'pending'].includes(state.access.status) && cloudEnabled() && !cloud.isSyncing()) startCloudSync(state.user);
+    render();
   },
   'toggle-cloud'(el) {
     const on = el.checked;
@@ -1701,24 +2022,60 @@ const actions = {
 async function openMail(r, list, kind, el) {
   const to = list.map((x) => x.email).filter(Boolean);
   if (!to.length) return toast('אין כתובות מייל לנמענים שנבחרו');
+  const win = kind === 'gmail' ? window.open('', '_blank') : null;
   busy(el, true);
   try {
+    const link = await shareLink(r);
     const subject = `${reportTitle(r)}${r.number ? ` ${r.number}` : ''} – ${site(r.siteId)?.name || ''} – ${formatDate(r.visitDate)}`;
-    const body = shareMessage(r, list.length === 1 ? list[0].name : '');
-    if (!isMobile()) {
-      const f = await makeFile(r, 'pdf');
-      download(f, f.name);
-      toast('ה-PDF הורד — צרף אותו למייל');
-    }
+    const body = shareMessage(r, list.length === 1 ? list[0].name : '', link);
     const url = kind === 'gmail'
       ? `https://mail.google.com/mail/?view=cm&fs=1&to=${encodeURIComponent(to.join(','))}&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`
       : `mailto:${to.map(encodeURIComponent).join(',')}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-    window.open(url, kind === 'gmail' ? '_blank' : '_self');
+    if (win) win.location.href = url;
+    else location.href = url;
+    if (!link) await fallbackFile(r);
     await rememberRecipients(r);
+  } catch (err) {
+    win?.close();
+    console.error(err);
+    toast('השליחה נכשלה', 'danger');
   } finally {
     busy(el, false);
     rerender();
   }
+}
+
+// כשאין קישור (בלי ענן / בלי רשת) — מורידים את ה-PDF כדי לצרף אותו ידנית
+async function fallbackFile(r) {
+  const f = await makeFile(r, 'pdf');
+  download(f, f.name);
+  toast('אין חיבור לענן, ולכן לא נוצר קישור. ה-PDF הורד — צרף אותו להודעה');
+}
+
+// קישור לדוח: ה-PDF נשמר בענן תחת מזהה אקראי שאי אפשר לנחש. מתעדכן אוטומטית אם הדוח השתנה מאז
+async function shareLink(r) {
+  if (!cloudEnabled() || !navigator.onLine) return null;
+  const url = (t) => `${location.origin}${location.pathname}#/v/${t}`;
+  if (r.shareToken && r.sharedVersion === r.updatedAt) return url(r.shareToken);
+  const model = buildModel(r, site(r.siteId), state.settings);
+  const blob = await exportPdf(model);
+  const pdf = await readFileAsDataURL(blob);
+  const token = r.shareToken || (crypto.randomUUID?.() || `${uid()}${uid()}`).replaceAll('-', '');
+  try {
+    await cloud.pushShared(token, {
+      pdf, filename: `${model.filename}.pdf`, title: reportTitle(r), site: site(r.siteId)?.name || '',
+      date: r.visitDate || '', company: state.settings.company.name || '', inspector: state.settings.inspector.name || '',
+    });
+  } catch (err) {
+    console.error(err);
+    toast('לא הצלחתי ליצור קישור בענן', 'danger');
+    return null;
+  }
+  r.shareToken = token;
+  r.updatedAt = Date.now();
+  r.sharedVersion = r.updatedAt;
+  await saveReport(r, { keepTime: true });
+  return url(token);
 }
 
 document.addEventListener('click', (e) => {
@@ -1773,6 +2130,20 @@ document.addEventListener('submit', async (e) => {
     rerender();
     return;
   }
+  if (action === 'admin-add') {
+    e.preventDefault();
+    const email = new FormData(form).get('email').trim().toLowerCase();
+    if (!email) return;
+    try {
+      await cloud.addAdmin(email);
+      toast(`${email} הוא עכשיו מנהל ✓`);
+      await loadAdmin();
+    } catch (err) {
+      console.error(err);
+      toast('אין הרשאה להוסיף מנהל', 'danger');
+    }
+    return;
+  }
   if (action !== 'new-site-report') return;
   e.preventDefault();
   const name = new FormData(form).get('name').trim();
@@ -1781,6 +2152,41 @@ document.addEventListener('submit', async (e) => {
   await saveSite(s);
   startReport(form.dataset.type, s.id, form.dataset.form);
 });
+
+// ---------------- access & usage ----------------
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, j) => setTimeout(() => j(new Error('timeout')), ms))]);
+async function checkAccess() {
+  try {
+    state.access = await withTimeout(cloud.myAccess(), 7000);
+    try { localStorage.setItem(`bakar-access-${state.user.uid}`, JSON.stringify(state.access)); } catch {}
+  } catch {
+    // בלי רשת — משתמשים במצב האחרון שנשמר (הכללים בשרת אוכפים בכל מקרה)
+    let cached = null;
+    try { cached = JSON.parse(localStorage.getItem(`bakar-access-${state.user.uid}`)); } catch {}
+    state.access = cached || { admin: false, status: 'open' };
+  }
+}
+
+// נתוני שימוש שהמנהל רואה (סעיף 6): כמות אתרים, דוחות, תמונות ונפח משוער
+function usageStats() {
+  const reps = savedReports();
+  const month = today().slice(0, 7);
+  let bytes = 0;
+  for (const r of reps) bytes += JSON.stringify({ ...r, photos: r.photos.map(({ src, ...m }) => m) }).length + r.photos.reduce((a, p) => a + (p.src?.length || 0), 0);
+  for (const st of state.sites) bytes += JSON.stringify(st).length + arr(st.files).reduce((a, f) => a + Math.round((f.size || 0) * 1.37), 0);
+  return {
+    stats: {
+      sites: state.sites.length,
+      reports: reps.length,
+      reportsMonth: reps.filter((r) => new Date(r.createdAt || 0).toISOString().slice(0, 7) === month).length,
+      photos: reps.reduce((a, r) => a + r.photos.length, 0),
+      bytes,
+    },
+  };
+}
+const reportUsage = debounce(() => {
+  if (state.user && cloudEnabled()) cloud.updateUserIndex(usageStats()).catch(() => {});
+}, 8000);
 
 // ---------------- boot ----------------
 // יציאה מדוח חדש שלא נערך — הטיוטה נזרקת ולא נוצרת כפילות (סעיף 18)
@@ -1825,7 +2231,10 @@ cloud.onUser(async (user) => {
     await dropLegacyData();
     toast(`הועברו לחשבון ${legacy.reports.length} דוחות ו-${legacy.sites.length} אתרים מהמכשיר`);
   }
+  await checkAccess();
   render();
+  cloud.updateUserIndex(usageStats()).catch(() => {});
+  if (state.access.status === 'blocked' || state.access.status === 'pending') return;
   if (cloudEnabled()) startCloudSync(user);
 });
 

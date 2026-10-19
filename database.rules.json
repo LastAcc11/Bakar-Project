@@ -2,10 +2,48 @@
   "rules": {
     ".read": false,
     ".write": false,
+
     "users": {
       "$uid": {
         ".read": "auth != null && auth.uid === $uid",
+        ".write": "auth != null && auth.uid === $uid && root.child('access').child($uid).val() !== 'blocked' && (root.child('config/requireApproval').val() !== true || root.child('access').child($uid).val() === 'approved' || (auth.token.email_verified === true && (auth.token.email.toLowerCase() === 'hjkhjk876543@gmail.com' || root.child('admins').child(auth.token.email.toLowerCase().replace('.', ',')).exists())))"
+      }
+    },
+
+    "userIndex": {
+      ".read": "auth != null && auth.token.email_verified === true && (auth.token.email.toLowerCase() === 'hjkhjk876543@gmail.com' || root.child('admins').child(auth.token.email.toLowerCase().replace('.', ',')).exists())",
+      "$uid": {
         ".write": "auth != null && auth.uid === $uid"
+      }
+    },
+
+    "access": {
+      ".read": "auth != null && auth.token.email_verified === true && (auth.token.email.toLowerCase() === 'hjkhjk876543@gmail.com' || root.child('admins').child(auth.token.email.toLowerCase().replace('.', ',')).exists())",
+      ".write": "auth != null && auth.token.email_verified === true && (auth.token.email.toLowerCase() === 'hjkhjk876543@gmail.com' || root.child('admins').child(auth.token.email.toLowerCase().replace('.', ',')).exists())",
+      "$uid": {
+        ".read": "auth != null && auth.uid === $uid",
+        ".validate": "newData.val() === 'approved' || newData.val() === 'blocked'"
+      }
+    },
+
+    "admins": {
+      ".read": "auth != null && auth.token.email_verified === true && (auth.token.email.toLowerCase() === 'hjkhjk876543@gmail.com' || root.child('admins').child(auth.token.email.toLowerCase().replace('.', ',')).exists())",
+      ".write": "auth != null && auth.token.email_verified === true && (auth.token.email.toLowerCase() === 'hjkhjk876543@gmail.com' || root.child('admins').child(auth.token.email.toLowerCase().replace('.', ',')).exists())",
+      "$key": {
+        ".read": "auth != null && auth.token.email != null && auth.token.email.toLowerCase().replace('.', ',') === $key"
+      }
+    },
+
+    "config": {
+      ".read": "auth != null",
+      ".write": "auth != null && auth.token.email_verified === true && (auth.token.email.toLowerCase() === 'hjkhjk876543@gmail.com' || root.child('admins').child(auth.token.email.toLowerCase().replace('.', ',')).exists())"
+    },
+
+    "shared": {
+      "$token": {
+        ".read": true,
+        ".write": "auth != null && ((!data.exists() && newData.child('owner').val() === auth.uid) || data.child('owner').val() === auth.uid)",
+        ".validate": "newData.child('owner').val() === auth.uid && newData.child('pdf').isString() && newData.child('pdf').val().length < 14000000 && $token.length >= 20"
       }
     }
   }
